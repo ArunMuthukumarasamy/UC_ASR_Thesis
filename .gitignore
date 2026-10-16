@@ -1,0 +1,22 @@
+# Data & caches (large / regenerable)
+data/raw/
+data/processed/*.parquet
+cache/*.sqlite
+cache/models/
+*.gz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Results are regenerable but keep tables; ignore heavy figure intermediates only if needed
+# (figures are small PNGs — keep them)
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

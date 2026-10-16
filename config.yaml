@@ -1,0 +1,141 @@
+# ============================================================================
+# UC-ASR: Uncertainty-Conditioned Adaptive Semantic Reranking
+# Master configuration for the full research pipeline.
+# Every module reads from this file so experiments are fully reproducible.
+# ============================================================================
+
+project:
+  name: "UC-ASR"
+  root: "."
+  seeds: [42, 100, 2026]          # multi-seed evaluation
+  primary_seed: 42
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  cache_dir: "cache"
+  results_dir: "results"
+  figures_dir: "results/figures"
+  llm_cache_db: "cache/llm_responses.sqlite"
+
+# ----------------------------------------------------------------------------
+# Dataset: McAuley-Lab Amazon Reviews 2023 - Grocery and Gourmet Food
+# ----------------------------------------------------------------------------
+dataset:
+  name: "Grocery_and_Gourmet_Food"
+  hf_repo: "McAuley-Lab/Amazon-Reviews-2023"
+  hf_review_subset: "raw_review_Grocery_and_Gourmet_Food"
+  hf_meta_subset: "raw_meta_Grocery_and_Gourmet_Food"
+  # Direct download URLs (primary path; HF datasets is the fallback)
+  review_url: "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/review_categories/Grocery_and_Gourmet_Food.jsonl.gz"
+  meta_url: "https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_Grocery_and_Gourmet_Food.jsonl.gz"
+  review_file: "Grocery_and_Gourmet_Food.jsonl.gz"
+  meta_file: "meta_Grocery_and_Gourmet_Food.jsonl.gz"
+
+preprocessing:
+  n_users_subset: 10000           # deterministic subset of users
+  k_core: 5                        # 5-core filtering (users & items >= 5 interactions)
+  min_user_interactions: 5
+  min_item_interactions: 5
+  split: "leave_one_out"           # chronological LOO
+  max_ram_gb: 8                    # streaming budget guard
+
+# ----------------------------------------------------------------------------
+# Retrievers
+# ----------------------------------------------------------------------------
+retrievers:
+  top_k_candidates: 50             # K=50 candidate list per user
+  popularity:
+    enabled: true
+  bpr_mf:
+    enabled: true
+    dim: 64
+    epochs: 50
+    lr: 0.01
+    reg: 0.0001
+    batch_size: 2048
+  lightgcn:
+    enabled: true
+    dim: 64
+    n_layers: 3
+    epochs: 50
+    lr: 0.001
+    reg: 0.0001
+    batch_size: 2048
+  faiss:
+    index_type: "IndexFlatIP"
+  sbert:
+    model: "all-MiniLM-L6-v2"
+
+# ----------------------------------------------------------------------------
+# LLM engine (Think-Before-Recommend)
+# ----------------------------------------------------------------------------
+llm:
+  backend: "hf"                    # "hf" (HuggingFace transformers) or "ollama"
+  hf_model: "Qwen/Qwen2.5-3B-Instruct"   # fallback: mistralai/Mistral-7B-Instruct-v0.2
+  ollama_model: "qwen2.5:3b"
+  ollama_url: "http://localhost:11434"
+  load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
+  dtype: "bfloat16"
+  device: "auto"                   # "auto" -> cuda if available else cpu
+  max_new_tokens: 512
+  relevance_min: 1.0
+  relevance_max: 5.0
+  cache_enabled: true
+
+# ----------------------------------------------------------------------------
+# Uncertainty quantification
+# ----------------------------------------------------------------------------
+uncertainty:
+  uaro:
+    n_passes: 3                    # N=3 stochastic passes
+    temperature: 0.7               # T=0.7
+  atm:
+    nli_model: "cross-encoder/nli-deberta-v3-base"   # bidirectional NLI entailment
+    sbert_sim_threshold: 0.85      # semantic equivalence clustering threshold
+    top_k: 10                      # k for Bayesian top-k threshold
+    beta: 0.5                      # latent noise sigma term (sigma_i^2 + beta^2)
+    epsilon: 0.1                   # boundary band epsilon for uncertain set
+
+# ----------------------------------------------------------------------------
+# Rerankers
+# ----------------------------------------------------------------------------
+rerankers:
+  single_pass:
+    n: 1
+    temperature: 0.0
+  uaro:
+    n: 3
+    lambda: 0.5                    # weight on uncertainty U
+    gamma: 0.3                     # weight on retrieval confidence E
+  atm:
+    epsilon: 0.1
+    batch_size: 10                 # listwise batch m=10
+  uc_asr:
+    tau_high: 0.75                 # confident gate threshold
+    tau_low: 0.40                  # unstable gate threshold
+    deep_samples: 2                # +2 verification samples for unstable
+    batch_size: 10                 # listwise batch m=10 for ambiguous
+    # FinalScore = alpha*R + beta*CR + delta*E - gamma*U  (tuned on val)
+    alpha: 1.0
+    beta: 0.5
+    delta: 0.3
+    gamma: 0.5
+
+# ----------------------------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------------------------
+evaluation:
+  cutoffs: [10]                    # Recall@10, NDCG@10
+  metrics: ["recall", "ndcg", "mrr"]
+  methods:
+    - "Popularity"
+    - "MF"
+    - "LightGCN"
+    - "SBERT reranker"
+    - "Single-pass LLM"
+    - "UARO"
+    - "ATM-style adaptive"
+    - "UC-ASR"
+  wilcoxon_baseline: "ATM-style adaptive"   # UC-ASR compared against this
+  figure_dpi: 300
