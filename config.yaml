@@ -17,6 +17,7 @@ paths:
   results_dir: "results"
   figures_dir: "results/figures"
   llm_cache_db: "cache/llm_responses.sqlite"
+  sbert_emb_cache: "cache/sbert_emb"   # persisted SBERT embedding cache
 
 # ----------------------------------------------------------------------------
 # Dataset: McAuley-Lab Amazon Reviews 2023 - Grocery and Gourmet Food
@@ -39,6 +40,7 @@ preprocessing:
   min_item_interactions: 5
   split: "leave_one_out"           # chronological LOO
   max_ram_gb: 8                    # streaming budget guard
+  data_parse_max_bad_frac: 0.01    # abort parse if > this fraction of lines are malformed
 
 # ----------------------------------------------------------------------------
 # Retrievers
@@ -66,6 +68,7 @@ retrievers:
     index_type: "IndexFlatIP"
   sbert:
     model: "all-MiniLM-L6-v2"
+    profile_max_items: 20          # SBERT/ATM user-profile item cap (most-recent train titles)
 
 # ----------------------------------------------------------------------------
 # LLM engine (Think-Before-Recommend)
@@ -76,7 +79,7 @@ llm:
   ollama_model: "qwen2.5:3b"
   ollama_url: "http://localhost:11434"
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
-  dtype: "bfloat16"
+  dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
   device: "auto"                   # "auto" -> cuda if available else cpu
   max_new_tokens: 512
   relevance_min: 1.0
@@ -121,6 +124,7 @@ rerankers:
     beta: 0.5
     delta: 0.3
     gamma: 0.5
+    tune_on_val: true              # grid-search {tau_high, tau_low} on val (full scale only)
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -139,3 +143,66 @@ evaluation:
     - "UC-ASR"
   wilcoxon_baseline: "ATM-style adaptive"   # UC-ASR compared against this
   figure_dpi: 300
+
+# ----------------------------------------------------------------------------
+# Scale system: --scale selects an overlay merged onto the base config above.
+# All knobs live here (no magic numbers in code). `full` keeps base values.
+# If the `scales:` block is missing, load_config must fail loudly (see design B.2).
+# ----------------------------------------------------------------------------
+scales:
+  full: {}                         # base config values are the full-scale experiment
+  smoke:
+    preprocessing:
+      n_users_subset: 200          # tiny deterministic user subset
+      k_core: 2                    # single threshold; min_user/item derived from it (NIT-3)
+    retrievers:
+      top_k_candidates: 20         # fewer candidates per user
+      bpr_mf: { epochs: 3 }
+      lightgcn: { epochs: 3 }
+    uncertainty:
+      uaro: { n_passes: 3 }        # keep N=3 (cheap under mock LLM)
+    llm:
+      backend: "mock"              # deterministic mock LLM at smoke scale
+    rerankers:
+      uc_asr: { tune_on_val: false }     # skip val grid-search at smoke scale
+    evaluation:
+      figure_dpi: 150                    # faster figure render for smoke; full stays 300
+      smoke_max_eval_users: 100          # cap users scored by LLM rerankers in smoke
+
+# ----------------------------------------------------------------------------
+# Ablation studies (config-driven; each toggles ONE UC-ASR component).
+# Note: UC-ASR FinalScore = alpha*R + beta*CR + delta*E - gamma*U; lambda is
+# UARO-only and NOT part of UC-ASR. Ablation 1 disables the uncertainty term in
+# UC-ASR notation by setting rerankers.uc_asr.gamma = 0.
+# ----------------------------------------------------------------------------
+ablations:
+  - name: "no_uncertainty_term"
+    desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore; lambda is UARO-only, N/A here)"
+    override: { rerankers: { uc_asr: { gamma: 0.0 } } }
+  - name: "no_retrieval_confidence_term"
+    desc: "UC-ASR delta=0 (drop delta*E)"
+    override: { rerankers: { uc_asr: { delta: 0.0 } } }
+  - name: "no_cluster_ratio_term"
+    desc: "UC-ASR beta=0 (drop beta*CR)"
+    override: { rerankers: { uc_asr: { beta: 0.0 } } }
+  - name: "no_confident_freeze_tier"
+    desc: "force all candidates through listwise rerank (disable confident freeze)"
+    override: { rerankers: { uc_asr: { tau_high: 1.01 } } }
+  - name: "no_unstable_deep_tier"
+    desc: "disable unstable deep-sampling tier (deep_samples=0)"
+    override: { rerankers: { uc_asr: { deep_samples: 0 } } }
+  - name: "gate_off_fixed_n3"
+    desc: "gate off -> fixed N=3 everywhere (UARO-like)"
+    override: {}
+  - name: "cr_sbert_only_vs_sbert_nli"
+    desc: "CR via SBERT-only vs SBERT+NLI"
+    override: {}
+  - name: "beta_latent_noise_sensitivity"
+    desc: "ATM beta latent-noise sweep (0.25 / 0.5 / 1.0)"
+    sweep: { uncertainty.atm.beta: [0.25, 0.5, 1.0] }
+  - name: "n_passes_sensitivity"
+    desc: "N passes sweep (1 / 3 / 5)"
+    sweep: { uncertainty.uaro.n_passes: [1, 3, 5] }
+  - name: "tau_threshold_sensitivity"
+    desc: "UC-ASR tau threshold sweep (+/- 0.1)"
+    sweep: { rerankers.uc_asr.tau_high: [0.65, 0.75, 0.85] }
