@@ -95,6 +95,10 @@ uncertainty:
     temperature: 0.7               # T=0.7
   atm:
     nli_model: "cross-encoder/nli-deberta-v3-base"   # bidirectional NLI entailment
+    use_nli: false                 # SBERT is authoritative (design B.6); NLI is an
+                                   # OPTIONAL tightening -- off by default so CR is fast
+                                   # on CPU. The cr_sbert_only_vs_sbert_nli ablation
+                                   # flips this on to compare the two clustering signals.
     sbert_sim_threshold: 0.85      # semantic equivalence clustering threshold
     top_k: 10                      # k for Bayesian top-k threshold
     beta: 0.5                      # latent noise sigma term (sigma_i^2 + beta^2)
@@ -153,7 +157,9 @@ scales:
   full: {}                         # base config values are the full-scale experiment
   smoke:
     preprocessing:
-      n_users_subset: 200          # tiny deterministic user subset
+      n_users_subset: 6000         # deterministic user subset (large enough that
+                                   # a workable set survives 2-core on the sparse
+                                   # Grocery category; full scale uses 10000/5-core)
       k_core: 2                    # single threshold; min_user/item derived from it (NIT-3)
     retrievers:
       top_k_candidates: 20         # fewer candidates per user
@@ -167,7 +173,15 @@ scales:
       uc_asr: { tune_on_val: false }     # skip val grid-search at smoke scale
     evaluation:
       figure_dpi: 150                    # faster figure render for smoke; full stays 300
-      smoke_max_eval_users: 100          # cap users scored by LLM rerankers in smoke
+      smoke_max_eval_users: 500          # cap users scored by LLM rerankers in smoke.
+                                         # Set above the smoke test-user count so LLM
+                                         # methods score the SAME population as the
+                                         # retrieval-only baselines (comparable rows);
+                                         # the mock LLM keeps this fast. Full scale has
+                                         # no cap.
+      smoke_max_ablation_users: 40       # tighter cap for the 10 ablations (incl. the
+                                         # NLI-on sweep variant) so smoke stays in minutes;
+                                         # full scale has no cap (runs all users)
 
 # ----------------------------------------------------------------------------
 # Ablation studies (config-driven; each toggles ONE UC-ASR component).
@@ -196,7 +210,7 @@ ablations:
     override: {}
   - name: "cr_sbert_only_vs_sbert_nli"
     desc: "CR via SBERT-only vs SBERT+NLI"
-    override: {}
+    sweep: { uncertainty.atm.use_nli: [false, true] }
   - name: "beta_latent_noise_sensitivity"
     desc: "ATM beta latent-noise sweep (0.25 / 0.5 / 1.0)"
     sweep: { uncertainty.atm.beta: [0.25, 0.5, 1.0] }

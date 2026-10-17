@@ -1,8 +1,12 @@
 # Data & caches (large / regenerable)
 data/raw/
 data/processed/*.parquet
+data/processed/*.json
 cache/*.sqlite
+cache/*.sqlite-wal
+cache/*.sqlite-shm
 cache/models/
+cache/sbert_emb/
 *.gz
 
 # Python
