@@ -217,6 +217,15 @@ def load_config(path: str = "config.yaml", scale: str = "smoke") -> Config:
     pre["min_user_interactions"] = k_core
     pre["min_item_interactions"] = k_core
 
+    # --- Kaggle environment auto-detection -------------------------------
+    # On Kaggle, /kaggle/input is READ-ONLY and all outputs must go under
+    # /kaggle/working. When running there, redirect the project root for
+    # writable outputs and, if an attached dataset carries the raw files,
+    # point raw_dir at it. Local/other runs are untouched. Opt out with
+    # UC_ASR_NO_KAGGLE_PATHS=1.
+    if _on_kaggle() and os.environ.get("UC_ASR_NO_KAGGLE_PATHS") != "1":
+        _apply_kaggle_paths(merged)
+
     _validate_config(merged)
 
     cfg = _wrap(merged)
@@ -316,6 +325,52 @@ def ensure_dirs(cfg: Mapping[str, Any], keys: Iterable[str] | None = None) -> No
             os.makedirs(os.path.dirname(target), exist_ok=True)
         else:
             os.makedirs(target, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Kaggle environment helpers
+# --------------------------------------------------------------------------- #
+
+
+def _on_kaggle() -> bool:
+    """True when running inside a Kaggle kernel."""
+    return (
+        os.path.isdir("/kaggle/working")
+        or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
+        or "KAGGLE_URL_BASE" in os.environ
+    )
+
+
+def _apply_kaggle_paths(merged: Dict[str, Any]) -> None:
+    """Redirect writable paths to /kaggle/working and raw reads to an input dataset.
+
+    Mutates ``merged`` in place. ``project.root`` becomes /kaggle/working so all
+    relative ``paths.*`` resolve to a writable location. If a Kaggle input
+    dataset directory contains the raw .jsonl.gz files, ``paths.raw_dir`` is
+    pointed at it (read-only reads are fine). The dataset slug can be overridden
+    with the UC_ASR_KAGGLE_DATASET env var (expects /kaggle/input/<slug>).
+    """
+    project = merged.setdefault("project", {})
+    project["root"] = "/kaggle/working"
+
+    paths = merged.setdefault("paths", {})
+    ds = merged.get("dataset", {})
+    review = ds.get("review_file", "Grocery_and_Gourmet_Food.jsonl.gz")
+
+    slug = os.environ.get("UC_ASR_KAGGLE_DATASET")
+    candidates = []
+    if slug:
+        candidates.append(os.path.join("/kaggle/input", slug))
+    # Scan attached input datasets for one that holds the raw review file.
+    input_root = "/kaggle/input"
+    if os.path.isdir(input_root):
+        for entry in sorted(os.listdir(input_root)):
+            candidates.append(os.path.join(input_root, entry))
+            candidates.append(os.path.join(input_root, entry, "raw"))
+    for cand in candidates:
+        if os.path.isfile(os.path.join(cand, review)):
+            paths["raw_dir"] = cand
+            break
 
 
 if __name__ == "__main__":  # pragma: no cover - lightweight self-test
