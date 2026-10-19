@@ -53,6 +53,17 @@ from src.uncertainty import (
 log = get_logger("rerankers")
 
 
+def _resolve_cap(eval_cfg, suffix):
+    """Return the single active ``*<suffix>`` cap from the resolved eval config.
+
+    Scale-neutral: exactly one scale overlay is merged at a time, so at most one
+    key matching ``suffix`` is present (smoke->smoke_max_eval_users,
+    kaggle->kaggle_max_eval_users, full->none). Returns ``int`` or ``None``.
+    """
+    vals = [v for k, v in eval_cfg.items() if k.endswith(suffix) and v is not None]
+    return int(vals[0]) if vals else None
+
+
 # --------------------------------------------------------------------------- #
 # Shared scaffold
 # --------------------------------------------------------------------------- #
@@ -86,9 +97,11 @@ class RerankContext:
         self.top_k = int(atm["top_k"])
         self.rmid = (float(cfg["llm"]["relevance_min"]) + float(cfg["llm"]["relevance_max"])) / 2.0
 
-        # Smoke bound: LLM rerankers only score the first N users by user_idx.
+        # Scale-bound: LLM rerankers only score the first N users by user_idx.
+        # The active scale overlay supplies at most one *max_eval_users cap
+        # (smoke/kaggle); full has none and scores every user.
         self.eval_users = sorted(candidates["user_idx"].unique().tolist())
-        cap = cfg["evaluation"].get("smoke_max_eval_users")
+        cap = _resolve_cap(cfg["evaluation"], "max_eval_users")
         if cap is not None:
             self.eval_users = self.eval_users[: int(cap)]
 
@@ -621,7 +634,7 @@ def run(cfg: Config) -> Dict[str, Any]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR rerankers")
-    parser.add_argument("--scale", choices=["smoke", "full"], default="smoke")
+    parser.add_argument("--scale", choices=["smoke", "full", "kaggle"], default="smoke")
     parser.add_argument("--config", default="config.yaml")
     return parser
 

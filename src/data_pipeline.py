@@ -679,7 +679,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR data pipeline")
     parser.add_argument(
         "--scale",
-        choices=["smoke", "full"],
+        choices=["smoke", "full", "kaggle"],
         default="smoke",
         help="config scale overlay to apply (default: smoke)",
     )

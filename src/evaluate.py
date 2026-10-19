@@ -25,7 +25,7 @@ import pandas as pd  # noqa: E402
 from scipy.stats import wilcoxon  # noqa: E402
 
 from src.common import Config, ensure_dirs, get_logger, load_config, resolve_path, set_seed  # noqa: E402
-from src.rerankers import RerankContext, run_reranker, tune_uc_asr_on_val  # noqa: E402
+from src.rerankers import RerankContext, _resolve_cap, run_reranker, tune_uc_asr_on_val  # noqa: E402
 from src.retrievers import (  # noqa: E402
     SBERTEncoder,
     build_candidate_text,
@@ -343,7 +343,7 @@ def write_ablations(cfg: Config, base_seed_res: Dict[str, Any], candidates, meth
         name = ab["name"]
         desc = ab.get("desc", "")
         variants = _ablation_variants(cfg, ab)
-        abl_cap = cfg["evaluation"].get("smoke_max_ablation_users")
+        abl_cap = _resolve_cap(cfg["evaluation"], "max_ablation_users")
         # Average the sweep variants (or single override) for the row.
         rec_l, ndcg_l, call_l = [], [], []
         for vcfg, uc_over in variants:
@@ -617,7 +617,7 @@ def _self_test() -> None:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR evaluation")
-    parser.add_argument("--scale", choices=["smoke", "full"], default="smoke")
+    parser.add_argument("--scale", choices=["smoke", "full", "kaggle"], default="smoke")
     parser.add_argument("--config", default="config.yaml")
     return parser
 

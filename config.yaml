@@ -204,10 +204,10 @@ scales:
       uc_asr: { tune_on_val: true }      # grid-search thresholds on val (real run)
     evaluation:
       figure_dpi: 300                    # publication-quality figures
-      kaggle_max_eval_users: 2000        # cap users scored by LLM rerankers to fit ~12h;
-                                         # raise toward n_users_subset across multiple
-                                         # sessions (cache makes reruns cheap)
-      kaggle_max_ablation_users: 300     # tighter cap for the 10 ablations
+      kaggle_max_eval_users: 300         # 300 eval users on seed 42 fits one ~12h T4
+                                         # session (~8-11h); raise across multiple
+                                         # sessions since the SQLite cache makes reruns cheap
+      kaggle_max_ablation_users: 100     # tighter cap for the 10 ablations
 
 # ----------------------------------------------------------------------------
 # Ablation studies (config-driven; each toggles ONE UC-ASR component).

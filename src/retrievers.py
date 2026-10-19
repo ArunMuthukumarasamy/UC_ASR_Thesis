@@ -626,7 +626,7 @@ def run(cfg: Config) -> Dict[str, str]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR retrievers")
-    parser.add_argument("--scale", choices=["smoke", "full"], default="smoke")
+    parser.add_argument("--scale", choices=["smoke", "full", "kaggle"], default="smoke")
     parser.add_argument("--config", default="config.yaml")
     return parser
 
