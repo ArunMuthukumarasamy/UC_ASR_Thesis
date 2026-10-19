@@ -78,6 +78,20 @@ def popularity_scores(train_df: pd.DataFrame, n_items: int) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 
+def _resolve_device() -> str:
+    """Resolve the compute device for retriever training (cuda if available).
+
+    Mirrors the ``"auto"`` resolution in :mod:`src.llm_engine`: use CUDA when a
+    GPU is present, otherwise fall back to CPU so the dev laptop runs unchanged.
+    """
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:  # pragma: no cover - torch is a locked dependency
+        return "cpu"
+
+
 def _build_user_pos_items(train_df: pd.DataFrame, n_users: int) -> List[np.ndarray]:
     """Per-user array of positive item indices (train history)."""
     pos: List[List[int]] = [[] for _ in range(n_users)]
@@ -87,34 +101,115 @@ def _build_user_pos_items(train_df: pd.DataFrame, n_users: int) -> List[np.ndarr
     return [np.asarray(sorted(set(p)), dtype=np.int64) for p in pos]
 
 
-def _sample_bpr_triples(
+def _build_bpr_sampling_tables(
     user_pos: List[np.ndarray],
-    n_items: int,
-    batch_size: int,
-    generator: "object",
-) -> Tuple["object", "object", "object"]:
-    """Sample a batch of ``(u, i_pos, i_neg)`` triples with a seeded generator."""
+) -> Tuple["object", "object", "object", "object"]:
+    """Build padded tensors for vectorised BPR triple sampling.
+
+    Returns ``(users_with_pos, pos_matrix, pos_lengths, pos_sorted)`` where:
+
+    * ``users_with_pos`` -- 1-D LongTensor of user indices that have >=1 positive.
+    * ``pos_matrix`` -- ``(n_u, max_len)`` LongTensor; row ``r`` holds user
+      ``users_with_pos[r]``'s positive item indices, right-padded with the
+      item in column 0 (padding is harmless because a vectorised gather only
+      reads ``offset < length`` columns).
+    * ``pos_lengths`` -- ``(n_u,)`` LongTensor of per-user positive counts.
+    * ``pos_sorted`` -- same shape/content as ``pos_matrix`` but each row sorted
+      ascending (and padded with a sentinel ``-1`` beyond ``length``), used for
+      a vectorised ``searchsorted`` membership test during negative rejection.
+
+    All tensors live on CPU; sampling draws small index tensors that are cheap
+    to keep on CPU regardless of where the embedding math runs.
+    """
     import torch
 
     users_with_pos = [u for u, p in enumerate(user_pos) if len(p) > 0]
     if not users_with_pos:
         raise RuntimeError("no users with positive interactions for BPR sampling")
-    uw = torch.tensor(users_with_pos, dtype=torch.long)
-    idx = torch.randint(0, len(uw), (batch_size,), generator=generator)
-    u_batch = uw[idx]
 
-    pos_items = torch.empty(batch_size, dtype=torch.long)
-    neg_items = torch.empty(batch_size, dtype=torch.long)
-    for b in range(batch_size):
-        u = int(u_batch[b])
-        p = user_pos[u]
-        pos_items[b] = int(p[int(torch.randint(0, len(p), (1,), generator=generator))])
-        pos_set = set(p.tolist())
-        while True:
-            cand = int(torch.randint(0, n_items, (1,), generator=generator))
-            if cand not in pos_set:
-                neg_items[b] = cand
-                break
+    lengths = [len(user_pos[u]) for u in users_with_pos]
+    max_len = max(lengths)
+    n_u = len(users_with_pos)
+
+    pos_matrix = torch.zeros((n_u, max_len), dtype=torch.long)
+    pos_sorted = torch.full((n_u, max_len), -1, dtype=torch.long)
+    for r, u in enumerate(users_with_pos):
+        p = torch.as_tensor(user_pos[u], dtype=torch.long)
+        L = p.shape[0]
+        pos_matrix[r, :L] = p
+        # user_pos rows are already sorted/unique (see _build_user_pos_items).
+        pos_sorted[r, :L] = p
+
+    uw = torch.tensor(users_with_pos, dtype=torch.long)
+    pos_lengths = torch.tensor(lengths, dtype=torch.long)
+    return uw, pos_matrix, pos_lengths, pos_sorted
+
+
+def _sample_bpr_triples(
+    user_pos: List[np.ndarray],
+    n_items: int,
+    batch_size: int,
+    generator: "object",
+    tables: Optional[Tuple["object", "object", "object", "object"]] = None,
+) -> Tuple["object", "object", "object"]:
+    """Sample a batch of ``(u, i_pos, i_neg)`` triples with a seeded generator.
+
+    Fully vectorised: one RNG draw per quantity (batch of users, batch of
+    positive offsets, batch of negatives) plus a bounded resample loop that
+    only touches the entries that collided with a true positive. Deterministic
+    given ``generator``. Returns three 1-D CPU LongTensors of length
+    ``batch_size`` -- identical signature/contract to the previous per-sample
+    implementation.
+
+    ``tables`` is the precomputed output of :func:`_build_bpr_sampling_tables`;
+    it is built lazily (and cached by callers across steps) to avoid rebuilding
+    the padded matrices every batch.
+    """
+    import torch
+
+    if tables is None:
+        tables = _build_bpr_sampling_tables(user_pos)
+    uw, pos_matrix, pos_lengths, pos_sorted = tables
+
+    n_u = uw.shape[0]
+    # 1) Sample the batch of users (indices into users_with_pos).
+    row = torch.randint(0, n_u, (batch_size,), generator=generator)
+    u_batch = uw[row]
+
+    # 2) Sample one positive per user: a uniform offset in [0, length) gathered
+    #    from that user's padded positive row -- no Python loop.
+    lens = pos_lengths[row]
+    rand01 = torch.rand((batch_size,), generator=generator)
+    offsets = (rand01 * lens.to(torch.float64)).to(torch.long)
+    offsets = torch.minimum(offsets, lens - 1)  # guard float rounding at the top
+    pos_items = pos_matrix[row, offsets]
+
+    # 3) Sample negatives for the whole batch at once, then vectorised rejection:
+    #    resample ONLY the entries whose draw is a true positive for their user.
+    #    Membership is a per-row searchsorted against the sorted positive row.
+    neg_items = torch.randint(0, n_items, (batch_size,), generator=generator)
+
+    def _is_positive(rows: "object", neg: "object") -> "object":
+        sorted_rows = pos_sorted[rows]  # (m, max_len), -1 padded, ascending
+        ins = torch.searchsorted(sorted_rows, neg.unsqueeze(1)).clamp_max(
+            sorted_rows.shape[1] - 1
+        )
+        found = sorted_rows.gather(1, ins).squeeze(1) == neg
+        return found
+
+    collide = _is_positive(row, neg_items)
+    max_retries = 10
+    for _ in range(max_retries):
+        if not bool(collide.any()):
+            break
+        idx = collide.nonzero(as_tuple=False).squeeze(1)
+        resampled = torch.randint(0, n_items, (idx.shape[0],), generator=generator)
+        neg_items[idx] = resampled
+        still = _is_positive(row[idx], resampled)
+        collide = torch.zeros_like(collide)
+        collide[idx] = still
+    # Any residual collisions (astronomically rare) are acceptable for BPR.
+
     return u_batch, pos_items, neg_items
 
 
@@ -135,6 +230,9 @@ def train_bpr_mf(
     reg = float(rc["reg"])
     batch_size = int(rc["batch_size"])
 
+    device = _resolve_device()
+    # Sampling generator stays on CPU (indices are tiny); the embedding math
+    # runs on `device` (cuda when present, else cpu -- CPU path unchanged).
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
 
@@ -142,16 +240,25 @@ def train_bpr_mf(
     item_emb = torch.nn.Embedding(n_items, dim)
     torch.nn.init.normal_(user_emb.weight, std=0.1)
     torch.nn.init.normal_(item_emb.weight, std=0.1)
+    user_emb = user_emb.to(device)
+    item_emb = item_emb.to(device)
+    log.info("BPR-MF training on device=%s (dim=%d, epochs=%d)", device, dim, epochs)
 
     opt = torch.optim.Adam(list(user_emb.parameters()) + list(item_emb.parameters()), lr=lr)
     user_pos = _build_user_pos_items(train_df, n_users)
+    sampling_tables = _build_bpr_sampling_tables(user_pos)
     n_inter = int(len(train_df))
     steps = max(1, n_inter // batch_size)
 
     for ep in range(epochs):
         total = 0.0
         for _ in range(steps):
-            u, ip, ineg = _sample_bpr_triples(user_pos, n_items, batch_size, gen)
+            u, ip, ineg = _sample_bpr_triples(
+                user_pos, n_items, batch_size, gen, tables=sampling_tables
+            )
+            u = u.to(device)
+            ip = ip.to(device)
+            ineg = ineg.to(device)
             ue = user_emb(u)
             pe = item_emb(ip)
             ne = item_emb(ineg)
@@ -220,14 +327,24 @@ def train_lightgcn(
     reg = float(rc["reg"])
     batch_size = int(rc["batch_size"])
 
+    device = _resolve_device()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
 
     emb = torch.nn.Embedding(n_users + n_items, dim)
     torch.nn.init.normal_(emb.weight, std=0.1)
-    adj = _build_norm_adj(train_df, n_users, n_items)
+    emb = emb.to(device)
+    adj = _build_norm_adj(train_df, n_users, n_items).to(device)
+    log.info(
+        "LightGCN training on device=%s (dim=%d, layers=%d, epochs=%d)",
+        device,
+        dim,
+        n_layers,
+        epochs,
+    )
     opt = torch.optim.Adam(emb.parameters(), lr=lr)
     user_pos = _build_user_pos_items(train_df, n_users)
+    sampling_tables = _build_bpr_sampling_tables(user_pos)
     n_inter = int(len(train_df))
     steps = max(1, n_inter // batch_size)
 
@@ -244,7 +361,12 @@ def train_lightgcn(
         total = 0.0
         for _ in range(steps):
             all_emb = propagate()
-            u, ip, ineg = _sample_bpr_triples(user_pos, n_items, batch_size, gen)
+            u, ip, ineg = _sample_bpr_triples(
+                user_pos, n_items, batch_size, gen, tables=sampling_tables
+            )
+            u = u.to(device)
+            ip = ip.to(device)
+            ineg = ineg.to(device)
             ue = all_emb[u]
             pe = all_emb[n_users + ip]
             ne = all_emb[n_users + ineg]

@@ -210,20 +210,28 @@ scales:
       kaggle_max_ablation_users: 100     # tighter cap for the 10 ablations
 
   # --- Kaggle FAST validation profile: a ~1-2h real-LLM smoke/validation run on a
-  #     single T4 (50 eval users, seed 42). Identical to `kaggle` in every modeling
-  #     knob (same 5-core / 10k users, same K=50 / 50-epoch retrievers, same N=3
-  #     uncertainty passes, same real HF Qwen2.5-3B 4-bit bfloat16 backend, same
-  #     tune_on_val and 300-DPI figures) EXCEPT the eval/ablation caps are tiny so it
-  #     finishes quickly. Run this FIRST to confirm the GPU + 4-bit model + score-
-  #     parsing path works end-to-end before launching the full ~8-11h `kaggle` run.
+  #     single T4 (50 eval users, seed 42). Its PURPOSE is to validate the LLM path
+  #     (GPU + 4-bit Qwen2.5-3B + score-parsing) end-to-end before the full ~8-11h
+  #     `kaggle` run, so EVERYTHING ELSE is deliberately shrunk to finish in minutes:
+  #       * retriever training is scaled DOWN (2000-user subset, K=50, 10 epochs for
+  #         both BPR-MF and LightGCN) so the retrieve stage no longer dominates the
+  #         wall-clock -- it completes in minutes, leaving the LLM path as the thing
+  #         actually being validated;
+  #       * the LLM backend is identical to `kaggle` (real HF Qwen2.5-3B 4-bit
+  #         bfloat16), uncertainty keeps N=3 passes, uc_asr keeps tune_on_val, and
+  #         figures stay 300-DPI;
+  #       * the eval/ablation caps are tiny (50 / 20 users).
+  #     This exercises the REAL LLM path on real (small) data without paying for a
+  #     50-epoch retriever train on the full 10k-user graph. The full `kaggle`
+  #     profile above keeps 10k users / 5-core / 50 epochs for the real experiment.
   kaggle_fast:
     preprocessing:
-      n_users_subset: 10000      # same as kaggle: full user target, survives 5-core
+      n_users_subset: 2000       # shrunk vs kaggle (10000) so retrieve finishes fast
       k_core: 5                  # same real 5-core as kaggle
     retrievers:
       top_k_candidates: 50       # same full K=50 candidate list as kaggle
-      bpr_mf: { epochs: 50 }
-      lightgcn: { epochs: 50 }
+      bpr_mf: { epochs: 10 }     # shrunk vs kaggle (50) -> retrieve stage in minutes
+      lightgcn: { epochs: 10 }   # shrunk vs kaggle (50) -> retrieve stage in minutes
     uncertainty:
       uaro: { n_passes: 3 }      # same N=3 stochastic passes @ T=0.7 as kaggle
     llm:
