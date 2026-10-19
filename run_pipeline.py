@@ -71,7 +71,7 @@ _ORDER = ["data", "retrieve", "rerank", "eval"]
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR pipeline orchestrator")
-    parser.add_argument("--scale", choices=["smoke", "full", "kaggle"], default="smoke")
+    parser.add_argument("--scale", choices=["smoke", "full", "kaggle", "kaggle_fast"], default="smoke")
     parser.add_argument("--stage", choices=["data", "retrieve", "rerank", "eval", "all"], default="all")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--force", action="store_true", help="rebuild stage outputs even if present")

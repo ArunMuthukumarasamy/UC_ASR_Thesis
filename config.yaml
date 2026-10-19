@@ -209,6 +209,36 @@ scales:
                                          # sessions since the SQLite cache makes reruns cheap
       kaggle_max_ablation_users: 100     # tighter cap for the 10 ablations
 
+  # --- Kaggle FAST validation profile: a ~1-2h real-LLM smoke/validation run on a
+  #     single T4 (50 eval users, seed 42). Identical to `kaggle` in every modeling
+  #     knob (same 5-core / 10k users, same K=50 / 50-epoch retrievers, same N=3
+  #     uncertainty passes, same real HF Qwen2.5-3B 4-bit bfloat16 backend, same
+  #     tune_on_val and 300-DPI figures) EXCEPT the eval/ablation caps are tiny so it
+  #     finishes quickly. Run this FIRST to confirm the GPU + 4-bit model + score-
+  #     parsing path works end-to-end before launching the full ~8-11h `kaggle` run.
+  kaggle_fast:
+    preprocessing:
+      n_users_subset: 10000      # same as kaggle: full user target, survives 5-core
+      k_core: 5                  # same real 5-core as kaggle
+    retrievers:
+      top_k_candidates: 50       # same full K=50 candidate list as kaggle
+      bpr_mf: { epochs: 50 }
+      lightgcn: { epochs: 50 }
+    uncertainty:
+      uaro: { n_passes: 3 }      # same N=3 stochastic passes @ T=0.7 as kaggle
+    llm:
+      backend: "hf"              # same REAL HuggingFace model as kaggle
+      hf_model: "Qwen/Qwen2.5-3B-Instruct"
+      load_in_4bit: true         # same CUDA + bitsandbytes 4-bit path as kaggle
+      dtype: "bfloat16"          # consulted only on CUDA path
+      device: "auto"             # -> cuda on Kaggle
+    rerankers:
+      uc_asr: { tune_on_val: true }      # same val grid-search as kaggle
+    evaluation:
+      figure_dpi: 300                    # same publication-quality figures as kaggle
+      kaggle_fast_max_eval_users: 50     # tiny eval cap -> ~1-2h validation run on seed 42
+      kaggle_fast_max_ablation_users: 20 # tiny ablation cap to keep the validation run fast
+
 # ----------------------------------------------------------------------------
 # Ablation studies (config-driven; each toggles ONE UC-ASR component).
 # Note: UC-ASR FinalScore = alpha*R + beta*CR + delta*E - gamma*U; lambda is
