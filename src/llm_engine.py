@@ -301,21 +301,39 @@ class HFBackend:
 
         hf_set_seed(int(seed))
         messages = [{"role": "user", "content": prompt}]
+        # Build the prompt as a STRING via the chat template first (version-robust),
+        # then tokenize to a dict/BatchEncoding. Avoids passing a BatchEncoding
+        # positionally to model.generate (which crashes on newer transformers).
         try:
-            inputs = self._tok.apply_chat_template(
-                messages, add_generation_prompt=True, return_tensors="pt"
-            ).to(self._device)
+            text_in = self._tok.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            enc = self._tok(text_in, return_tensors="pt")
         except Exception:  # noqa: BLE001 - tokenizer without chat template
-            inputs = self._tok(prompt, return_tensors="pt").input_ids.to(self._device)
+            enc = self._tok(prompt, return_tensors="pt")
+        # Move the whole encoding to device (BatchEncoding and dict both support .items()).
+        enc = {k: v.to(self._device) for k, v in enc.items()}
+        input_ids = enc["input_ids"]
+
         do_sample = float(temperature) > 0.0
+        gen_kwargs: Dict[str, Any] = {}
+        if do_sample:
+            # Only pass temperature when sampling; omit entirely otherwise so no
+            # None is passed (which warns/errors on some transformers versions).
+            gen_kwargs["temperature"] = float(temperature)
+        pad_token_id = self._tok.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self._tok.eos_token_id
         with torch.no_grad():
             out = self._model.generate(
-                inputs,
+                **enc,
                 max_new_tokens=self._max_new,
                 do_sample=do_sample,
-                temperature=float(temperature) if do_sample else None,
+                pad_token_id=pad_token_id,
+                **gen_kwargs,
             )
-        text = self._tok.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
+        prompt_len = input_ids.shape[1]
+        text = self._tok.decode(out[0][prompt_len:], skip_special_tokens=True)
         parsed = parse_response(text, self._rmin, self._rmax)
         parsed["raw"] = text
         return parsed
