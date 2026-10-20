@@ -226,7 +226,14 @@ scales:
   #     profile above keeps 10k users / 5-core / 50 epochs for the real experiment.
   kaggle_fast:
     preprocessing:
-      n_users_subset: 2000       # shrunk vs kaggle (10000) so retrieve finishes fast
+      n_users_subset: 2000       # k-core now runs on the FULL dataset FIRST (data_pipeline
+                                 # parse_reviews), so the user subset is drawn FROM the
+                                 # already-dense 5-core. A 2000-user sample from the core is
+                                 # dense and survives the k-core safety-net re-check, giving a
+                                 # non-degenerate train/val/test split -- the old collapse that
+                                 # forced 10000 (subset-then-kcore on a sparse uniform sample)
+                                 # no longer applies. Small subset keeps the 10-epoch retriever
+                                 # train fast for this ~1-2h validation profile.
       k_core: 5                  # same real 5-core as kaggle
     retrievers:
       top_k_candidates: 50       # same full K=50 candidate list as kaggle

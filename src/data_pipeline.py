@@ -22,7 +22,6 @@ import datetime as _dt
 import gzip
 import json
 import os
-from collections import defaultdict
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -253,44 +252,48 @@ def _select_user_subset(user_ids: List[str], n_subset: int, seed: int) -> set:
     return chosen
 
 
-def _iterative_kcore(
-    user_counts: Dict[str, int],
-    item_counts: Dict[str, int],
-    pair_user_items: Dict[str, Dict[str, int]],
+def _iterative_kcore_edges(
+    edge_u: np.ndarray,
+    edge_i: np.ndarray,
+    n_users: int,
+    n_items: int,
     k_core: int,
-) -> Tuple[set, set]:
-    """Two-sided iterative k-core to a fixed point on the subset interactions.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Two-sided iterative k-core to a fixed point over integer edge arrays.
 
-    ``pair_user_items[u][i]`` is the interaction count for (u, i) restricted to
-    the chosen user subset. Returns the surviving ``(users, items)`` sets.
+    ``edge_u`` / ``edge_i`` are parallel int arrays: the n-th interaction links
+    ``user edge_u[n]`` with ``item edge_i[n]`` (one entry per retained review
+    line, matching the per-interaction counting semantics of the pipeline).
+    Users/items are dropped iteratively while their surviving interaction degree
+    is ``< k_core`` until a fixed point. Vectorised with ``numpy.bincount`` so a
+    full-dataset pass (~tens of millions of edges) stays fast and well under the
+    8 GB budget: only a handful of int arrays sized to the edge/entity counts
+    are ever held (no Python-level dict-of-dicts).
+
+    Returns boolean survival masks ``(user_mask, item_mask)`` of lengths
+    ``n_users`` / ``n_items`` respectively.
     """
-    users = set(user_counts)
-    items = set(item_counts)
+    edge_alive = np.ones(edge_u.shape[0], dtype=bool)
+    user_alive = np.ones(n_users, dtype=bool)
+    item_alive = np.ones(n_items, dtype=bool)
+
     while True:
-        drop_users = {u for u in users if user_counts[u] < k_core}
-        drop_items = {i for i in items if item_counts[i] < k_core}
-        if not drop_users and not drop_items:
+        live_u = edge_u[edge_alive]
+        live_i = edge_i[edge_alive]
+        user_deg = np.bincount(live_u, minlength=n_users)
+        item_deg = np.bincount(live_i, minlength=n_items)
+
+        drop_user = user_alive & (user_deg < k_core)
+        drop_item = item_alive & (item_deg < k_core)
+        if not drop_user.any() and not drop_item.any():
             break
-        # Remove dropped users: decrement affected item counts.
-        for u in drop_users:
-            for i, c in pair_user_items[u].items():
-                if i in item_counts:
-                    item_counts[i] -= c
-            users.discard(u)
-            user_counts.pop(u, None)
-        # Remove dropped items: decrement affected user counts.
-        for u in list(users):
-            row = pair_user_items.get(u, {})
-            removed = 0
-            for i in drop_items:
-                c = row.pop(i, 0)
-                removed += c
-            if removed:
-                user_counts[u] -= removed
-        for i in drop_items:
-            items.discard(i)
-            item_counts.pop(i, None)
-    return users, items
+
+        user_alive &= ~drop_user
+        item_alive &= ~drop_item
+        # An edge survives only while BOTH endpoints survive.
+        edge_alive = user_alive[edge_u] & item_alive[edge_i]
+
+    return user_alive, item_alive
 
 
 def parse_reviews(
@@ -298,6 +301,22 @@ def parse_reviews(
     cfg: Mapping[str, Any],
 ) -> Tuple[pd.DataFrame, set, int, int]:
     """Stream-parse reviews into a filtered interaction frame.
+
+    Ordering (standard recsys practice; design B.3): run iterative two-sided
+    k-core on the **FULL** dataset first to obtain a dense core, THEN take the
+    deterministic user subset FROM the surviving core users, and keep every
+    chosen user's interactions on core items. Running k-core before subsetting
+    matters on a sparse catalogue like Amazon Grocery: a uniform-random user
+    sample taken first almost never co-occurs on items, so co-occurrence
+    collapses and the core degenerates to ~1 user / 1 item. Taking the subset
+    from an already-dense core, each chosen user keeps its full-core interaction
+    count (the user-side k-core invariant: >= k interactions on core items),
+    which guarantees a non-degenerate chronological LOO split. We do NOT re-run
+    a two-sided k-core on the subset: on this sparse catalogue dropping ~418k of
+    ~420k core users strips item support and a two-sided re-core would cascade
+    the whole subset back to a degenerate result -- the exact collapse this
+    ordering fix exists to avoid. The retained user-side invariant is verified
+    and logged explicitly.
 
     Returns ``(interactions_df, surviving_items, bad_lines_skipped,
     missing_ts_dropped)``. ``interactions_df`` has columns
@@ -309,9 +328,17 @@ def parse_reviews(
     max_bad_frac = float(pre["data_parse_max_bad_frac"])
     seed = int(cfg["project"]["primary_seed"])
 
-    # ---- Counting pass: per-user counts over all reviews -------------------
-    log.info("counting pass over reviews ...")
-    user_total: Dict[str, int] = defaultdict(int)
+    # ---- (a) counting pass: integer-encode (u, i) edges over ALL reviews ---
+    # Memory-efficient full-dataset structure: assign contiguous int ids to
+    # users/items on the fly and record one int64 edge pair per retained review
+    # line. For Grocery (~14M reviews) this is a handful of int arrays plus two
+    # id-dicts -- a few hundred MB, well under the 8 GB budget. We deliberately
+    # avoid a dict-of-dicts over the full data (that WOULD risk the budget).
+    log.info("counting pass over ALL reviews (full-dataset k-core input) ...")
+    user2idx: Dict[str, int] = {}
+    item2idx: Dict[str, int] = {}
+    edge_u_list: List[int] = []
+    edge_i_list: List[int] = []
     total_lines = 0
     bad_lines = 0
     missing_ts = 0
@@ -322,61 +349,138 @@ def parse_reviews(
             continue
         fields = _extract_review(rec)
         if fields is None:
-            # Distinguish a missing-timestamp drop from a structural miss where
-            # we cannot tell; count it as a missing-ts drop only if user+item
-            # were present. We re-check cheaply here.
+            # Count a missing-timestamp drop only when user+item were present.
             if rec.get("user_id") and (rec.get("parent_asin") or rec.get("asin")):
                 missing_ts += 1
             continue
-        user_id = fields[0]
-        user_total[user_id] += 1
+        user_id, item_id, _rating, _ts = fields
+        u = user2idx.get(user_id)
+        if u is None:
+            u = len(user2idx)
+            user2idx[user_id] = u
+        i = item2idx.get(item_id)
+        if i is None:
+            i = len(item2idx)
+            item2idx[item_id] = i
+        edge_u_list.append(u)
+        edge_i_list.append(i)
 
     _abort_if_too_many_bad(bad_lines, total_lines, max_bad_frac)
 
-    # ---- Deterministic user subset ----------------------------------------
-    chosen_users = _select_user_subset(list(user_total.keys()), n_subset, seed)
+    n_users_all = len(user2idx)
+    n_items_all = len(item2idx)
+    edge_u = np.asarray(edge_u_list, dtype=np.int64)
+    edge_i = np.asarray(edge_i_list, dtype=np.int64)
+    del edge_u_list, edge_i_list
     log.info(
-        "selected deterministic user subset: %d of %d users (requested %d)",
-        len(chosen_users),
-        len(user_total),
-        n_subset,
+        "full dataset: %d users, %d items, %d usable interactions",
+        n_users_all,
+        n_items_all,
+        edge_u.shape[0],
     )
 
-    # ---- Build subset interaction counts for iterative k-core -------------
-    log.info("collecting subset interactions for k-core ...")
-    user_counts: Dict[str, int] = defaultdict(int)
-    item_counts: Dict[str, int] = defaultdict(int)
-    pair_user_items: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for rec, ok in _iter_jsonl_gz(review_path, "subset reviews"):
-        if not ok:
-            continue
-        fields = _extract_review(rec)
-        if fields is None:
-            continue
-        user_id, item_id, _rating, _ts = fields
-        if user_id not in chosen_users:
-            continue
-        user_counts[user_id] += 1
-        item_counts[item_id] += 1
-        pair_user_items[user_id][item_id] += 1
-
-    surviving_users, surviving_items = _iterative_kcore(
-        user_counts, item_counts, pair_user_items, k_core
+    # ---- (b) iterative k-core on the FULL dataset --------------------------
+    log.info("running iterative k-core (k=%d) on the FULL dataset ...", k_core)
+    core_user_mask, core_item_mask = _iterative_kcore_edges(
+        edge_u, edge_i, n_users_all, n_items_all, k_core
     )
+    n_core_users = int(core_user_mask.sum())
+    n_core_items = int(core_item_mask.sum())
     log.info(
-        "k-core (k=%d) fixed point: %d users, %d items surviving",
+        "full-data k-core (k=%d) fixed point: %d users, %d items surviving "
+        "(of %d / %d)",
         k_core,
-        len(surviving_users),
-        len(surviving_items),
+        n_core_users,
+        n_core_items,
+        n_users_all,
+        n_items_all,
     )
-    if not surviving_users or not surviving_items:
+    if n_core_users == 0 or n_core_items == 0:
         raise RuntimeError(
-            f"k-core filtering (k={k_core}) left no surviving users/items on a "
-            f"subset of {len(chosen_users)} users. Lower preprocessing.k_core or "
-            "raise n_users_subset."
+            f"k-core filtering (k={k_core}) left no surviving users/items on the "
+            f"FULL dataset ({n_users_all} users, {n_items_all} items). "
+            "Lower preprocessing.k_core."
         )
 
-    # ---- Collecting pass: keep surviving (u, i) rows ----------------------
+    # ---- (c) deterministic user subset FROM the surviving core users -------
+    idx2user = {u: uid for uid, u in user2idx.items()}
+    core_user_ids = [idx2user[u] for u in np.nonzero(core_user_mask)[0]]
+    chosen_user_ids = _select_user_subset(core_user_ids, n_subset, seed)
+    log.info(
+        "selected deterministic user subset FROM core: %d of %d core users "
+        "(requested %d)",
+        len(chosen_user_ids),
+        n_core_users,
+        n_subset,
+    )
+    if len(chosen_user_ids) < n_subset:
+        log.info(
+            "core has fewer than the requested %d users; keeping all %d core users",
+            n_subset,
+            len(chosen_user_ids),
+        )
+
+    # ---- (d) restrict edges to (chosen core users, core items) -------------
+    # Keep every chosen core user's interactions on core items. The user-side
+    # k-core invariant is preserved exactly: a user that passed the full-data
+    # k-core had >= k interactions on core items, and restricting the kept user
+    # set does NOT remove any of THAT user's own interactions -- so each chosen
+    # user still has >= k >= 3 interactions and is LOO-eligible (one val + one
+    # test). We deliberately do NOT re-run a two-sided k-core here: on a sparse
+    # catalogue like Grocery, dropping ~418k of ~420k core users strips item
+    # support, and a two-sided re-core would then cascade the whole subset to a
+    # degenerate ~3-user result (empty val/test) -- the exact collapse this fix
+    # exists to avoid. It is fine for item support to drop; evaluation handles
+    # low-support held-out items. We log the user-side min degree as a loud,
+    # explicit check of the invariant.
+    chosen_user_mask = np.zeros(n_users_all, dtype=bool)
+    for uid in chosen_user_ids:
+        chosen_user_mask[user2idx[uid]] = True
+    keep_edge = chosen_user_mask[edge_u] & core_item_mask[edge_i]
+    sub_edge_u = edge_u[keep_edge]
+    sub_edge_i = edge_i[keep_edge]
+    log.info(
+        "restricted to chosen core users x core items: %d interactions",
+        sub_edge_u.shape[0],
+    )
+
+    # Verify (and log) the user-side k-core invariant on the retained edges.
+    kept_user_deg = np.bincount(sub_edge_u, minlength=n_users_all)
+    chosen_user_idx = np.nonzero(chosen_user_mask)[0]
+    min_user_deg = int(kept_user_deg[chosen_user_idx].min()) if len(chosen_user_idx) else 0
+    log.info(
+        "user-side invariant: all %d chosen users retain >= %d interactions "
+        "(min observed = %d)",
+        len(chosen_user_idx),
+        k_core,
+        min_user_deg,
+    )
+    if min_user_deg < k_core:
+        # Should never happen given the full-data k-core; guard loudly if it does.
+        raise RuntimeError(
+            f"user-side k-core invariant violated: min per-user interactions "
+            f"{min_user_deg} < k_core {k_core} after subsetting. This indicates "
+            "an ordering bug in the full-data k-core / subset step."
+        )
+
+    surviving_users = {idx2user[u] for u in chosen_user_idx}
+    idx2item = {i: iid for iid, i in item2idx.items()}
+    surviving_item_idx = np.unique(sub_edge_i)
+    surviving_items_ids = {idx2item[i] for i in surviving_item_idx}
+    log.info(
+        "retained subset (k-core-first, no destructive re-core): %d users, "
+        "%d items",
+        len(surviving_users),
+        len(surviving_items_ids),
+    )
+    if not surviving_users or not surviving_items_ids:
+        raise RuntimeError(
+            f"subsetting {len(chosen_user_ids)} core users left no surviving "
+            f"users/items (k={k_core}). Lower preprocessing.k_core or raise "
+            "n_users_subset."
+        )
+
+    # ---- (e) collecting pass: materialise surviving (u, i) rows -----------
     log.info("collecting pass: materializing surviving interactions ...")
     rows: List[Tuple[str, str, float, int]] = []
     for rec, ok in _iter_jsonl_gz(review_path, "keep reviews"):
@@ -386,7 +490,7 @@ def parse_reviews(
         if fields is None:
             continue
         user_id, item_id, rating, ts = fields
-        if user_id in surviving_users and item_id in surviving_items:
+        if user_id in surviving_users and item_id in surviving_items_ids:
             rows.append((user_id, item_id, rating, ts))
 
     df = pd.DataFrame(rows, columns=["user_id", "item_id", "rating", "timestamp"])
