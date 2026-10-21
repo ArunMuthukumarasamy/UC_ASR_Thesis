@@ -253,9 +253,12 @@ scales:
                                          # calls); the full `kaggle` profile keeps tune_on_val: true
                                          # for the real experiment.
     evaluation:
-      figure_dpi: 300                    # same publication-quality figures as kaggle
-      kaggle_fast_max_eval_users: 50     # tiny eval cap -> ~1-2h validation run on seed 42
-      kaggle_fast_max_ablation_users: 20 # tiny ablation cap to keep the validation run fast
+      figure_dpi: 150                    # validation figures don't need print quality -> faster
+                                         # render; the full `kaggle` profile keeps 300 dpi
+      kaggle_fast_max_eval_users: 3      # score just 3 users (one seed) purely to confirm the
+                                         # real Qwen path emits parseable 1.0-5.0 scores end-to-end
+                                         # in a few minutes; full `kaggle` keeps 300 eval users
+      kaggle_fast_max_ablation_users: 2  # tiny ablation cap so the validation run finishes fast
 
 # ----------------------------------------------------------------------------
 # Ablation studies (config-driven; each toggles ONE UC-ASR component).
