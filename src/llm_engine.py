@@ -165,16 +165,20 @@ def build_prompt(
         rating_str = "unknown" if average_rating is None else f"{float(average_rating):.2f}"
         lines.append(f"Item details -- price: {price_str}; rating: {rating_str}")
     lines += [
-        "Think step by step about whether this item fits the user, then rate its "
-        "relevance from 1.0 (irrelevant) to 5.0 (perfect match).",
-        "Respond in exactly this format:",
-        "Reasoning: <your reasoning>",
-        "Relevance: <a number from 1.0 to 5.0>",
+        "Rate how relevant this item is for the user on a scale from 1.0 "
+        "(irrelevant) to 5.0 (perfect match).",
+        "Respond in EXACTLY this format, with the score on the FIRST line:",
+        "Relevance: <a single number from 1.0 to 5.0>",
+        "Reasoning: <one or two sentences>",
     ]
     return "\n".join(lines)
 
 
 _REL_RE = re.compile(r"[-+]?\d*\.?\d+")
+# "4/5", "3.5 / 5", "85/100" -> captures (numerator, denominator).
+_FRACTION_RE = re.compile(r"([-+]?\d*\.?\d+)\s*/\s*(\d+)")
+# "4 out of 5", "3 of 5".
+_OUT_OF_FIVE_RE = re.compile(r"([-+]?\d*\.?\d+)\s*(?:out of|of)\s*5\b", re.IGNORECASE)
 
 
 def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
@@ -191,6 +195,22 @@ def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
     mr = re.search(r"Relevance:\s*(.*)$", text, re.IGNORECASE | re.DOTALL)
     if mr:
         rel_section = mr.group(1)
+
+    # Highest priority: fraction/scale phrasings (e.g. "4/5", "3.5/5",
+    # "4 out of 5"). A denominator of 5 means the numerator is the score.
+    # If a denominator is present but is NOT 5 (e.g. "8/10", "85/100"), skip
+    # that token so we do not misread an out-of-scale rating.
+    mf = _FRACTION_RE.search(rel_section)
+    if mf and int(mf.group(2)) == 5:
+        num = float(mf.group(1))
+        num = max(rmin, min(rmax, num))
+        return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
+    ms = _OUT_OF_FIVE_RE.search(rel_section)
+    if ms:
+        num = float(ms.group(1))
+        num = max(rmin, min(rmax, num))
+        return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
+
     candidates = [float(x) for x in _REL_RE.findall(rel_section)]
     valid = [v for v in candidates if rmin <= v <= rmax]
     if valid:
@@ -201,7 +221,11 @@ def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
     if anyvalid:
         return {"reasoning": reasoning, "relevance": float(anyvalid[-1]), "parsed_ok": True}
     mid = (rmin + rmax) / 2.0
-    log.warning("LLM response parse failure -> defaulting relevance to %.1f", mid)
+    log.warning(
+        "LLM response parse failure -> defaulting relevance to %.1f; raw(400)=%r",
+        mid,
+        " ".join(text.split())[:400],
+    )
     return {"reasoning": reasoning, "relevance": float(mid), "parsed_ok": False}
 
 

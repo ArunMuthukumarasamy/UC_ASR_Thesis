@@ -81,7 +81,7 @@ llm:
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
   device: "auto"                   # "auto" -> cuda if available else cpu
-  max_new_tokens: 512
+  max_new_tokens: 768             # raised from 512: score-first prompt reaches the score before truncation
   relevance_min: 1.0
   relevance_max: 5.0
   cache_enabled: true
