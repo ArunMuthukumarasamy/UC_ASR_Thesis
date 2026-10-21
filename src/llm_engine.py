@@ -155,25 +155,35 @@ def build_prompt(
     ``price: unknown`` and a null average_rating as ``rating: unknown`` so the
     cache key is deterministic regardless of missing values.
     """
+    # FIX A: instruction/task FIRST, profile + candidate as clearly delimited
+    # DATA blocks, answer format unmistakable LAST. The model must treat the
+    # profile as data to rate, not text to continue/echo.
     lines = [
-        "You are a recommendation assistant.",
-        f"User profile (recent purchases): {profile_text}",
-        f"Candidate item: {candidate_text}",
+        "You are a strict product-recommendation rater. You MUST answer, not repeat the input.",
+        "TASK: rate how relevant the CANDIDATE ITEM is for this user's tastes.",
+        "Use an integer 1-5 (1=irrelevant, 5=perfect match).",
+        "",
+        "USER_RECENT_PURCHASES:",
+        f"{profile_text}",
+        "",
+        "CANDIDATE_ITEM:",
+        f"{candidate_text}",
     ]
     if deep:
+        # NIT-6: render null price/rating as the literal 'unknown' for
+        # deterministic cache keys regardless of missing values.
         price_str = "unknown" if price is None else f"{float(price):.2f}"
         rating_str = "unknown" if average_rating is None else f"{float(average_rating):.2f}"
-        lines.append(f"Item details -- price: {price_str}; rating: {rating_str}")
+        lines += [
+            "",
+            "ITEM_DETAILS:",
+            f"price: {price_str}; rating: {rating_str}",
+        ]
     lines += [
-        "First think briefly about whether this item fits the user, then give "
-        "a relevance score.",
-        "Score on an INTEGER scale from 1 to 5, where 1 = irrelevant and "
-        "5 = perfect match.",
-        "End your answer with the score on its own final line in exactly this "
-        "form (no other text on that line):",
-        "Reasoning: <one or two sentences>",
-        "Score: <an integer from 1 to 5>",
-        "For example, a good answer ends with a line like: Score: 4",
+        "",
+        "Answer with EXACTLY two lines and nothing else:",
+        "Reasoning: <one short sentence>",
+        "Score: <integer 1-5>",
     ]
     return "\n".join(lines)
 
@@ -281,7 +291,11 @@ class MockBackend:
 
 
 def _extract_candidate_hint(prompt: str) -> str:
-    m = re.search(r"Candidate item:\s*(.*)", prompt)
+    # Match the CANDIDATE_ITEM: data block (FIX A format); fall back to the
+    # legacy "Candidate item:" phrasing for any older cached/alt prompts.
+    m = re.search(r"CANDIDATE_ITEM:\s*\n?(.*)", prompt, re.IGNORECASE)
+    if m is None:
+        m = re.search(r"Candidate item:\s*(.*)", prompt, re.IGNORECASE)
     if m:
         return m.group(1).strip()[:80]
     return "the candidate"
@@ -289,6 +303,10 @@ def _extract_candidate_hint(prompt: str) -> str:
 
 class HFBackend:
     """Local HuggingFace transformers backend; CPU-safe fallback (NIT-2)."""
+
+    # FIX D: module-level (class) counter so the FIRST 3 generate() calls log
+    # the exact prompt-token length and the FULL decoded text at INFO level.
+    _dbg = 0
 
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         import torch
@@ -349,7 +367,20 @@ class HFBackend:
         from transformers import set_seed as hf_set_seed
 
         hf_set_seed(int(seed))
-        messages = [{"role": "user", "content": prompt}]
+        # FIX B: proper system+user message list so the chat template frames
+        # the whole thing as an instruction (profile = data), not a single user
+        # turn the model continues/echoes.
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict product-recommendation rater. Always "
+                    "answer in the requested 'Reasoning:'/'Score:' format. Never "
+                    "repeat or echo the input."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
         # Tokenize the chat template DIRECTLY in one step so special tokens
         # (notably BOS) are added exactly once. Applying the template with
         # tokenize=False and then re-tokenizing the string double-adds BOS and
@@ -380,8 +411,12 @@ class HFBackend:
         enc = {k: v.to(self._device) for k, v in enc.items()}
         input_ids = enc["input_ids"]
 
+        # FIX E: generation sanity. When temperature>0 (N=3 passes @ T=0.7) use
+        # do_sample=True with temperature set; when temperature==0 (single-pass)
+        # do_sample=False and NO temperature/top_p passed. repetition_penalty is
+        # always applied to discourage verbatim echo/repetition (safe, standard).
         do_sample = float(temperature) > 0.0
-        gen_kwargs: Dict[str, Any] = {}
+        gen_kwargs: Dict[str, Any] = {"repetition_penalty": 1.3}
         if do_sample:
             # Only pass temperature when sampling; omit entirely otherwise so no
             # None is passed (which warns/errors on some transformers versions).
@@ -397,8 +432,39 @@ class HFBackend:
                 pad_token_id=pad_token_id,
                 **gen_kwargs,
             )
+        # FIX C: decode only the generated continuation (slice off the prompt).
         prompt_len = input_ids.shape[1]
-        text = self._tok.decode(out[0][prompt_len:], skip_special_tokens=True)
+        gen_ids = out[0][prompt_len:]
+        text = self._tok.decode(gen_ids, skip_special_tokens=True).strip()
+
+        # FIX D: log the FIRST 3 calls at INFO with exact prompt-token length
+        # and the FULL (untruncated) decoded text so the next short Kaggle run
+        # definitively shows echo vs real answer vs slice problem.
+        if HFBackend._dbg < 3:
+            log.info(
+                "HFDBG call#%d prompt_tok_len=%d raw_full=%r",
+                HFBackend._dbg,
+                prompt_len,
+                text,
+            )
+            HFBackend._dbg += 1
+
+        # FIX C: belt-and-suspenders defensive strip. If an echo prefix slipped
+        # through, drop everything before the answer so it cannot swamp
+        # parse_response. If a 'Score:' line exists, keep from the first
+        # 'Reasoning:' (or the 'Score:' line) onward. parse_response's contract
+        # is unchanged -- this only trims a leading echo.
+        if re.search(r"score:", text, re.IGNORECASE):
+            mr = re.search(r"reasoning:", text, re.IGNORECASE)
+            if mr is not None:
+                text = text[mr.start():]
+            else:
+                ms = re.search(r"score:", text, re.IGNORECASE)
+                # Keep from the start of the line containing 'Score:'.
+                line_start = text.rfind("\n", 0, ms.start()) + 1
+                text = text[line_start:]
+            text = text.strip()
+
         parsed = parse_response(text, self._rmin, self._rmax)
         parsed["raw"] = text
         return parsed
