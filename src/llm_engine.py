@@ -165,16 +165,24 @@ def build_prompt(
         rating_str = "unknown" if average_rating is None else f"{float(average_rating):.2f}"
         lines.append(f"Item details -- price: {price_str}; rating: {rating_str}")
     lines += [
-        "Rate how relevant this item is for the user on a scale from 1.0 "
-        "(irrelevant) to 5.0 (perfect match).",
-        "Respond in EXACTLY this format, with the score on the FIRST line:",
-        "Relevance: <a single number from 1.0 to 5.0>",
+        "First think briefly about whether this item fits the user, then give "
+        "a relevance score.",
+        "Score on an INTEGER scale from 1 to 5, where 1 = irrelevant and "
+        "5 = perfect match.",
+        "End your answer with the score on its own final line in exactly this "
+        "form (no other text on that line):",
         "Reasoning: <one or two sentences>",
+        "Score: <an integer from 1 to 5>",
+        "For example, a good answer ends with a line like: Score: 4",
     ]
     return "\n".join(lines)
 
 
 _REL_RE = re.compile(r"[-+]?\d*\.?\d+")
+# Explicit "Score: 4" / "Relevance: 3.5" markers. ``\d*\.?\d+`` requires at
+# least one digit so a garbled "Relevance: .a" never matches as a number.
+_SCORE_RE = re.compile(r"Score:\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
+_RELEVANCE_RE = re.compile(r"Relevance:\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
 # "4/5", "3.5 / 5", "85/100" -> captures (numerator, denominator).
 _FRACTION_RE = re.compile(r"([-+]?\d*\.?\d+)\s*/\s*(\d+)")
 # "4 out of 5", "3 of 5".
@@ -182,44 +190,61 @@ _OUT_OF_FIVE_RE = re.compile(r"([-+]?\d*\.?\d+)\s*(?:out of|of)\s*5\b", re.IGNOR
 
 
 def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
-    """Tolerant parse: last float in [rmin, rmax] is the score; else midpoint.
+    """Tolerant parse of a reason-first / score-last LLM response.
+
+    Handles both the new ``Score: <int>`` marker and the legacy
+    ``Relevance: <num>`` marker, in either order, with integer or float
+    scores, and tolerates garbled lines (e.g. ``Relevance: .a``). The score
+    is searched for in priority order; only a true midpoint default yields
+    ``parsed_ok=False``.
 
     Returns ``{"reasoning", "relevance", "parsed_ok"}``.
     """
+    # (a) Reasoning: text after "Reasoning:" up to a trailing Score:/Relevance:
+    # line if present, else the whole trimmed text.
     reasoning = text.strip()
-    m = re.search(r"Reasoning:\s*(.*?)(?:Relevance:|$)", text, re.IGNORECASE | re.DOTALL)
-    if m:
+    m = re.search(
+        r"Reasoning:\s*(.*?)(?:\n?\s*(?:Score|Relevance):|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m and m.group(1).strip():
         reasoning = m.group(1).strip()
 
-    rel_section = text
-    mr = re.search(r"Relevance:\s*(.*)$", text, re.IGNORECASE | re.DOTALL)
-    if mr:
-        rel_section = mr.group(1)
+    # (b) Score search, first branch to produce an in-range value wins.
 
-    # Highest priority: fraction/scale phrasings (e.g. "4/5", "3.5/5",
-    # "4 out of 5"). A denominator of 5 means the numerator is the score.
-    # If a denominator is present but is NOT 5 (e.g. "8/10", "85/100"), skip
-    # that token so we do not misread an out-of-scale rating.
-    mf = _FRACTION_RE.search(rel_section)
+    # 1. Explicit "Score:" marker -> take the LAST match (the final line).
+    score_matches = _SCORE_RE.findall(text)
+    for raw in reversed(score_matches):
+        num = max(rmin, min(rmax, float(raw)))
+        if rmin <= float(raw) <= rmax:
+            return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
+
+    # 2. Legacy "Relevance:" marker -> LAST in-range match. The regex requires
+    #    a digit, so "Relevance: .a" never matches here.
+    rel_matches = _RELEVANCE_RE.findall(text)
+    valid_rel = [float(x) for x in rel_matches if rmin <= float(x) <= rmax]
+    if valid_rel:
+        return {"reasoning": reasoning, "relevance": float(valid_rel[-1]), "parsed_ok": True}
+
+    # 3. Fraction / "out of 5" phrasings anywhere in the text. A denominator
+    #    of 5 means the numerator is the score; other denominators are skipped
+    #    so we do not misread an out-of-scale rating (e.g. "8/10").
+    mf = _FRACTION_RE.search(text)
     if mf and int(mf.group(2)) == 5:
-        num = float(mf.group(1))
-        num = max(rmin, min(rmax, num))
+        num = max(rmin, min(rmax, float(mf.group(1))))
         return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
-    ms = _OUT_OF_FIVE_RE.search(rel_section)
+    ms = _OUT_OF_FIVE_RE.search(text)
     if ms:
-        num = float(ms.group(1))
-        num = max(rmin, min(rmax, num))
+        num = max(rmin, min(rmax, float(ms.group(1))))
         return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
 
-    candidates = [float(x) for x in _REL_RE.findall(rel_section)]
-    valid = [v for v in candidates if rmin <= v <= rmax]
-    if valid:
-        return {"reasoning": reasoning, "relevance": float(valid[-1]), "parsed_ok": True}
-
-    # Fall back to any in-range float anywhere in the text, else the midpoint.
+    # 4. Any in-range float anywhere in the text.
     anyvalid = [float(x) for x in _REL_RE.findall(text) if rmin <= float(x) <= rmax]
     if anyvalid:
         return {"reasoning": reasoning, "relevance": float(anyvalid[-1]), "parsed_ok": True}
+
+    # 5. True midpoint default (the only parsed_ok=False path).
     mid = (rmin + rmax) / 2.0
     log.warning(
         "LLM response parse failure -> defaulting relevance to %.1f; raw(400)=%r",
