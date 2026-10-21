@@ -350,16 +350,32 @@ class HFBackend:
 
         hf_set_seed(int(seed))
         messages = [{"role": "user", "content": prompt}]
-        # Build the prompt as a STRING via the chat template first (version-robust),
-        # then tokenize to a dict/BatchEncoding. Avoids passing a BatchEncoding
-        # positionally to model.generate (which crashes on newer transformers).
+        # Tokenize the chat template DIRECTLY in one step so special tokens
+        # (notably BOS) are added exactly once. Applying the template with
+        # tokenize=False and then re-tokenizing the string double-adds BOS and
+        # breaks the instruction framing, which makes the model echo/continue
+        # the prompt instead of responding as an assistant.
         try:
-            text_in = self._tok.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
+            enc = self._tok.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,  # get a dict with input_ids AND attention_mask
             )
-            enc = self._tok(text_in, return_tensors="pt")
-        except Exception:  # noqa: BLE001 - tokenizer without chat template
-            enc = self._tok(prompt, return_tensors="pt")
+        except Exception:  # noqa: BLE001 - no chat template OR older API w/o return_dict
+            try:
+                input_ids_only = self._tok.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                # Older API returns a bare tensor -> wrap into a dict with a mask.
+                import torch as _torch
+
+                enc = {
+                    "input_ids": input_ids_only,
+                    "attention_mask": _torch.ones_like(input_ids_only),
+                }
+            except Exception:  # noqa: BLE001 - tokenizer without chat template at all
+                enc = self._tok(prompt, return_tensors="pt")
         # Move the whole encoding to device (BatchEncoding and dict both support .items()).
         enc = {k: v.to(self._device) for k, v in enc.items()}
         input_ids = enc["input_ids"]
