@@ -248,7 +248,10 @@ scales:
       dtype: "bfloat16"          # consulted only on CUDA path
       device: "auto"             # -> cuda on Kaggle
     rerankers:
-      uc_asr: { tune_on_val: true }      # same val grid-search as kaggle
+      uc_asr: { tune_on_val: false }     # kaggle_fast is a fast VALIDATION run -> skip the val
+                                         # grid-search (it would add a large extra batch of LLM
+                                         # calls); the full `kaggle` profile keeps tune_on_val: true
+                                         # for the real experiment.
     evaluation:
       figure_dpi: 300                    # same publication-quality figures as kaggle
       kaggle_fast_max_eval_users: 50     # tiny eval cap -> ~1-2h validation run on seed 42
