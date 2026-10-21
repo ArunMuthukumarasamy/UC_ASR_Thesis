@@ -225,6 +225,13 @@ scales:
   #     50-epoch retriever train on the full 10k-user graph. The full `kaggle`
   #     profile above keeps 10k users / 5-core / 50 epochs for the real experiment.
   kaggle_fast:
+    project:
+      # kaggle_fast validates on a single seed (42) to finish fast; the full
+      # `kaggle` profile keeps all 3 seeds [42,100,2026] for the real experiment
+      # via the base project.seeds. deep_merge overlays this project block on the
+      # base project, so base primary_seed (42) is preserved and only seeds is
+      # overridden -- eval then runs the real Qwen scoring ONCE instead of 3x.
+      seeds: [42]
     preprocessing:
       n_users_subset: 2000       # k-core now runs on the FULL dataset FIRST (data_pipeline
                                  # parse_reviews), so the user subset is drawn FROM the
