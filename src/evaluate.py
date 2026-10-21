@@ -617,7 +617,7 @@ def _self_test() -> None:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR evaluation")
-    parser.add_argument("--scale", choices=["smoke", "full", "kaggle", "kaggle_fast"], default="smoke")
+    parser.add_argument("--scale", choices=["smoke", "full", "kaggle", "kaggle_fast", "kaggle_unc"], default="smoke")
     parser.add_argument("--config", default="config.yaml")
     return parser
 

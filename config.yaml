@@ -267,6 +267,68 @@ scales:
                                          # in a few minutes; full `kaggle` keeps 300 eval users
       kaggle_fast_max_ablation_users: 2  # tiny ablation cap so the validation run finishes fast
 
+  # --- Kaggle UNCERTAINTY-THESIS profile: a feasible-but-sufficient real-LLM run on a
+  #     single Kaggle T4, sized to produce publishable uncertainty-method results in one
+  #     session WITHOUT the full ~8-11h `kaggle` cost.
+  #
+  #     PURPOSE: keep everything the UNCERTAINTY mechanism needs valid while cutting the
+  #     time sinks. Specifically it PROTECTS the three uncertainty signals ---
+  #       * UARO score-variance  : N=3 stochastic passes @ T=0.7 (unchanged);
+  #       * ATM cluster-ratio CR : clusters the reasoning TRACES, so reasoning length is
+  #                                kept long enough (max_new_tokens=256, NOT ~96) for the
+  #                                semantic clustering to be meaningful;
+  #       * UC-ASR 3-tier gate   : 150 eval users -> enough population to fill the
+  #                                Confident / Ambiguous / Unstable tiers with stable stats.
+  #
+  #     What it CUTS vs `kaggle` (the real experiment) to be feasible:
+  #       * single seed [42] instead of [42,100,2026] (the uncertainty mechanism does not
+  #         need multi-seed averaging to be valid);
+  #       * 150 eval users instead of 300;
+  #       * 3 uncertainty-critical ablations instead of all 10;
+  #       * skip the val grid-search (tune_on_val=false) -> saves a full extra LLM pass;
+  #       * max_new_tokens 256 instead of 768 -> faster generation while still long enough
+  #         for CR trace clustering.
+  #     Everything else matches `kaggle`: real HF Qwen2.5-3B 4-bit bfloat16, 10k-user
+  #     5-core dense graph, full 50-epoch BPR-MF + LightGCN retriever train, K=50
+  #     candidates, and 300-DPI publication figures (fig3 = uncertainty/gate distribution).
+  kaggle_unc:
+    project:
+      seeds: [42]                        # single seed (uncertainty mechanism doesn't need multi-seed)
+    preprocessing:
+      n_users_subset: 10000              # same dense core as kaggle (real retriever)
+      k_core: 5
+    retrievers:
+      top_k_candidates: 50
+      bpr_mf: { epochs: 50 }
+      lightgcn: { epochs: 50 }
+    uncertainty:
+      uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
+    llm:
+      backend: "hf"
+      hf_model: "Qwen/Qwen2.5-3B-Instruct"
+      load_in_4bit: true
+      dtype: "bfloat16"
+      device: "auto"
+      max_new_tokens: 256                # cut from 768 for speed, but NOT to ~96: the ATM cluster
+                                         # ratio clusters the reasoning TRACES, so keep enough
+                                         # reasoning length for meaningful semantic clustering
+    rerankers:
+      uc_asr: { tune_on_val: false }     # skip val grid-search to save a full extra LLM pass
+    evaluation:
+      figure_dpi: 300                    # keep publication figures (fig3 = uncertainty/gate dist)
+      kaggle_unc_max_eval_users: 150     # 150 users: enough to populate the gate tiers + stable stats
+      kaggle_unc_max_ablation_users: 60  # ablations run on a smaller user set to save time
+    ablations:                           # ONLY the 3 uncertainty-critical ablations (not all 10)
+      - name: "no_uncertainty_term"
+        desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
+        override: { rerankers: { uc_asr: { gamma: 0.0 } } }
+      - name: "no_cluster_ratio_term"
+        desc: "UC-ASR beta=0 (drop beta*CR)"
+        override: { rerankers: { uc_asr: { beta: 0.0 } } }
+      - name: "gate_off_fixed_n3"
+        desc: "gate off -> fixed N=3 everywhere (UARO-like)"
+        override: {}
+
 # ----------------------------------------------------------------------------
 # Ablation studies (config-driven; each toggles ONE UC-ASR component).
 # Note: UC-ASR FinalScore = alpha*R + beta*CR + delta*E - gamma*U; lambda is

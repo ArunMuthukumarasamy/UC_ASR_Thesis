@@ -309,14 +309,16 @@ def parse_reviews(
     matters on a sparse catalogue like Amazon Grocery: a uniform-random user
     sample taken first almost never co-occurs on items, so co-occurrence
     collapses and the core degenerates to ~1 user / 1 item. Taking the subset
-    from an already-dense core, each chosen user keeps its full-core interaction
-    count (the user-side k-core invariant: >= k interactions on core items),
-    which guarantees a non-degenerate chronological LOO split. We do NOT re-run
-    a two-sided k-core on the subset: on this sparse catalogue dropping ~418k of
-    ~420k core users strips item support and a two-sided re-core would cascade
-    the whole subset back to a degenerate result -- the exact collapse this
-    ordering fix exists to avoid. The retained user-side invariant is verified
-    and logged explicitly.
+    from an already-dense core, we THEN re-run the two-sided iterative k-core on
+    the chosen-user subset edges to re-densify the graph: a small user slice
+    (e.g. 6000 of ~420k core users) barely co-occurs on items, so without this
+    step item-side support collapses to ~1 interaction/item and the retrieval
+    hit rate falls to ~0. Re-coring the subset drops the non-co-occurring users
+    and items and restores a dense, collaborative-signal-bearing graph (the
+    densification that produces a healthy ``retrieval_hit_rate_at_50``). On
+    larger profiles (kaggle_fast/kaggle) the subset is already dense, so the
+    re-core is a near no-op that only trims genuinely under-k entities. The
+    re-cored survivors are derived directly from the surviving subset edges.
 
     Returns ``(interactions_df, surviving_items, bad_lines_skipped,
     missing_ts_dropped)``. ``interactions_df`` has columns
@@ -420,19 +422,15 @@ def parse_reviews(
             len(chosen_user_ids),
         )
 
-    # ---- (d) restrict edges to (chosen core users, core items) -------------
-    # Keep every chosen core user's interactions on core items. The user-side
-    # k-core invariant is preserved exactly: a user that passed the full-data
-    # k-core had >= k interactions on core items, and restricting the kept user
-    # set does NOT remove any of THAT user's own interactions -- so each chosen
-    # user still has >= k >= 3 interactions and is LOO-eligible (one val + one
-    # test). We deliberately do NOT re-run a two-sided k-core here: on a sparse
-    # catalogue like Grocery, dropping ~418k of ~420k core users strips item
-    # support, and a two-sided re-core would then cascade the whole subset to a
-    # degenerate ~3-user result (empty val/test) -- the exact collapse this fix
-    # exists to avoid. It is fine for item support to drop; evaluation handles
-    # low-support held-out items. We log the user-side min degree as a loud,
-    # explicit check of the invariant.
+    # ---- (d) restrict edges to (chosen core users, core items), then -------
+    #          re-run the two-sided k-core on the SUBSET to re-densify. -------
+    # Restricting to a small user slice taken from the full-data core leaves a
+    # star-sparse graph (each item kept by ~1 user), destroying the collaborative
+    # signal and collapsing retrieval. Re-running the two-sided iterative k-core
+    # on the subset edges drops the non-co-occurring users/items and restores a
+    # dense core -- the densification that keeps retrieval_hit_rate_at_50 healthy.
+    # On larger profiles the subset is already dense, so the re-core only trims
+    # genuinely under-k entities. Survivors are derived from the re-cored edges.
     chosen_user_mask = np.zeros(n_users_all, dtype=bool)
     for uid in chosen_user_ids:
         chosen_user_mask[user2idx[uid]] = True
@@ -444,32 +442,30 @@ def parse_reviews(
         sub_edge_u.shape[0],
     )
 
-    # Verify (and log) the user-side k-core invariant on the retained edges.
-    kept_user_deg = np.bincount(sub_edge_u, minlength=n_users_all)
-    chosen_user_idx = np.nonzero(chosen_user_mask)[0]
-    min_user_deg = int(kept_user_deg[chosen_user_idx].min()) if len(chosen_user_idx) else 0
-    log.info(
-        "user-side invariant: all %d chosen users retain >= %d interactions "
-        "(min observed = %d)",
-        len(chosen_user_idx),
-        k_core,
-        min_user_deg,
+    # Two-sided re-core on the subset to re-densify the graph.
+    sub_user_mask, sub_item_mask = _iterative_kcore_edges(
+        sub_edge_u, sub_edge_i, n_users_all, n_items_all, k_core
     )
-    if min_user_deg < k_core:
-        # Should never happen given the full-data k-core; guard loudly if it does.
-        raise RuntimeError(
-            f"user-side k-core invariant violated: min per-user interactions "
-            f"{min_user_deg} < k_core {k_core} after subsetting. This indicates "
-            "an ordering bug in the full-data k-core / subset step."
-        )
+    keep_edge2 = sub_user_mask[sub_edge_u] & sub_item_mask[sub_edge_i]
+    sub_edge_u = sub_edge_u[keep_edge2]
+    sub_edge_i = sub_edge_i[keep_edge2]
 
-    surviving_users = {idx2user[u] for u in chosen_user_idx}
-    idx2item = {i: iid for iid, i in item2idx.items()}
+    surviving_user_idx = np.unique(sub_edge_u)
     surviving_item_idx = np.unique(sub_edge_i)
+    log.info(
+        "subset two-sided k-core (k=%d) fixed point: %d users, %d items "
+        "(from %d chosen users)",
+        k_core,
+        surviving_user_idx.shape[0],
+        surviving_item_idx.shape[0],
+        len(chosen_user_ids),
+    )
+
+    idx2item = {i: iid for iid, i in item2idx.items()}
+    surviving_users = {idx2user[u] for u in surviving_user_idx}
     surviving_items_ids = {idx2item[i] for i in surviving_item_idx}
     log.info(
-        "retained subset (k-core-first, no destructive re-core): %d users, "
-        "%d items",
+        "retained subset (k-core-first + subset re-core): %d users, %d items",
         len(surviving_users),
         len(surviving_items_ids),
     )
@@ -783,7 +779,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UC-ASR data pipeline")
     parser.add_argument(
         "--scale",
-        choices=["smoke", "full", "kaggle", "kaggle_fast"],
+        choices=["smoke", "full", "kaggle", "kaggle_fast", "kaggle_unc"],
         default="smoke",
         help="config scale overlay to apply (default: smoke)",
     )
