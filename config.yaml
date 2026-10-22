@@ -78,8 +78,9 @@ llm:
   hf_model: "Qwen/Qwen2.5-3B-Instruct"   # fallback: mistralai/Mistral-7B-Instruct-v0.2
   ollama_model: "qwen2.5:3b"
   ollama_url: "http://localhost:11434"
-  gemini_model: "gemini-flash-latest"       # stable always-current flash alias confirmed via ListModels; if 404, run python scripts/list_gemini_models.py and pick another (e.g. gemini-2.5-flash, gemini-3.8-flash)
-  gemini_rpm: 15                          # free tier ~15 req/min; raise on paid tier
+  gemini_model: "gemini-2.5-flash-lite"   # gemini-2.5-flash-lite has the most generous free-tier quota and lowest cost, best for many calls; if 404 run scripts/list_gemini_models.py.
+  gemini_rpm: 10                          # lowered from 15 to stay under the free-tier per-minute limit; raise on paid tier
+  gemini_max_retries: 8                   # 429-aware retries need room: a free-tier per-MINUTE limit clears within ~60s, so the GeminiBackend retries up to this many times honouring the server retryDelay before raising
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
   device: "auto"                   # "auto" -> cuda if available else cpu
@@ -351,17 +352,19 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "gemini"                  # Google Gemini hosted API (no local GPU)
-      gemini_model: "gemini-flash-latest"
+      gemini_model: "gemini-2.5-flash-lite"
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
     evaluation:
       figure_dpi: 300
-      gemini_max_eval_users: 50          # capped at 50 for the free-tier DAILY request limit;
-                                         # raise on paid tier or spread across days (the SQLite
+      gemini_max_eval_users: 20          # free-tier DAILY quota is limited, so START SMALL (20);
+                                         # raise once a run confirms the daily budget holds, on a
+                                         # paid/billing tier, or spread across days (the SQLite
                                          # cache resumes). _resolve_cap picks this up via the
                                          # "*max_eval_users" suffix automatically.
-      gemini_max_ablation_users: 20      # tighter cap for the ablations (free-tier budget)
+      gemini_max_ablation_users: 10      # tighter cap for the ablations; start small on the
+                                         # free-tier daily budget and raise once confirmed/on billing
     ablations:                           # SAME 3 uncertainty-critical ablations as kaggle_unc
       - name: "no_uncertainty_term"
         desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"

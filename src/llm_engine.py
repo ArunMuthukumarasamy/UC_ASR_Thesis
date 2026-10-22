@@ -539,6 +539,17 @@ class GeminiBackend:
     _throttle_lock = threading.Lock()
     _last_request_ts = [0.0]  # mutable single-slot timestamp of last dispatch
 
+    # Log the FIRST 429 body (key-stripped, truncated) exactly once per process
+    # so the user can tell a per-MINUTE limit (clears in ~60s) from a per-DAY
+    # quota (does not clear until Pacific midnight) from the raw metric string.
+    _logged_429 = False
+
+    # 429-specific backoff: free-tier per-minute limits clear within ~60s, so
+    # allow more attempts and a higher cap than the 500/503 transient path.
+    _MAX_429_ATTEMPTS = 8
+    _BACKOFF_429_BASE = 5.0
+    _BACKOFF_429_CAP = 120.0
+
     # System framing identical in spirit to the HF backend.
     _SYSTEM = (
         "You are a strict product-recommendation rater. Always answer in the "
@@ -590,6 +601,54 @@ class GeminiBackend:
             text = text.replace(key, "<redacted>")
         return text
 
+    @staticmethod
+    def _parse_retry_delay(resp) -> Optional[float]:
+        """Extract a server-suggested retry delay (seconds) from a 429 response.
+
+        Google's 429 payload typically carries a ``RetryInfo`` entry inside
+        ``error.details[]`` with a ``retryDelay`` like ``"27s"``. Some responses
+        instead (or also) set a ``Retry-After`` header (seconds or HTTP-date).
+        Returns the delay in seconds, or ``None`` when neither is present/parseable.
+        """
+        # 1) Prefer the structured RetryInfo in the JSON body.
+        try:
+            data = resp.json()
+            details = (data.get("error", {}) or {}).get("details", []) or []
+            for det in details:
+                if not isinstance(det, Mapping):
+                    continue
+                if "RetryInfo" in str(det.get("@type", "")):
+                    raw = str(det.get("retryDelay", "")).strip()
+                    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)s?$", raw)
+                    if m:
+                        return float(m.group(1))
+        except (ValueError, AttributeError, TypeError):
+            pass  # body not JSON / unexpected shape -> fall through to header
+
+        # 2) Fall back to the Retry-After header (integer seconds only).
+        try:
+            hdr = resp.headers.get("Retry-After")
+            if hdr is not None:
+                m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$", str(hdr))
+                if m:
+                    return float(m.group(1))
+        except (AttributeError, TypeError):
+            pass
+        return None
+
+    @classmethod
+    def _log_first_429(cls, stripped_body: str) -> None:
+        """One-time INFO log of the first 429 body so the quota metric is visible."""
+        if cls._logged_429:
+            return
+        cls._logged_429 = True
+        log.info(
+            "First Gemini HTTP 429 body (key-stripped, first 300 chars) -- look for "
+            "'PerMinute'/'per minute' (clears within ~60s) vs 'PerDay'/'per day' "
+            "(daily free-tier quota, clears at Pacific midnight): %s",
+            stripped_body[:300],
+        )
+
     def generate(self, prompt: str, temperature: float, seed: int) -> Dict[str, Any]:
         import requests
 
@@ -607,8 +666,16 @@ class GeminiBackend:
             },
         }
 
+        # 429 (rate-limit / quota) gets its own, more generous attempt budget and
+        # retry-delay-aware sleeps because a per-MINUTE free-tier limit clears in
+        # ~60s; transient 500/503 keep the shorter exponential backoff. The total
+        # budget for the loop is the larger of the two so neither path is starved.
+        max_429 = max(self._max_retries, GeminiBackend._MAX_429_ATTEMPTS)
+        max_attempts = max(self._max_retries, max_429)
+
         last_err = ""
-        for attempt in range(self._max_retries):
+        attempts_429 = 0
+        for attempt in range(max_attempts):
             self._throttle()
             try:
                 resp = requests.post(url, json=body, headers=headers, timeout=self._timeout)
@@ -635,8 +702,40 @@ class GeminiBackend:
                 parsed["raw"] = text
                 return parsed
 
-            # Retry on transient server/rate-limit statuses.
-            if resp.status_code in (429, 500, 503) and attempt < self._max_retries - 1:
+            # --- Rate-limit / quota (429): honour server retry delay. --------- #
+            if resp.status_code == 429:
+                stripped = self._strip_key(resp.text, self._api_key)
+                last_err = stripped
+                self._log_first_429(stripped)
+                attempts_429 += 1
+                if attempts_429 < max_429:
+                    delay = self._parse_retry_delay(resp)
+                    if delay is not None:
+                        # Server told us when to retry -- honour it (capped).
+                        sleep_s = min(max(delay, 0.0), GeminiBackend._BACKOFF_429_CAP)
+                    else:
+                        # No hint -> exponential backoff from a higher base/cap.
+                        sleep_s = min(
+                            GeminiBackend._BACKOFF_429_BASE * (2 ** (attempts_429 - 1)),
+                            GeminiBackend._BACKOFF_429_CAP,
+                        )
+                    log.warning(
+                        "Gemini HTTP 429 (attempt %d/%d); sleeping %.1fs before retry.",
+                        attempts_429, max_429, sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                # 429 retries exhausted -> explicit, cause-revealing error.
+                raise RuntimeError(
+                    f"Gemini quota exceeded (HTTP 429) after {attempts_429} retries. "
+                    "If this is a per-DAY free-tier limit it will not clear until "
+                    "tomorrow (Pacific midnight); switch to a model with higher free "
+                    "quota (gemini-2.5-flash-lite), reduce evaluation.gemini_max_eval_users, "
+                    f"or enable billing. Raw: {stripped[:300]}"
+                )
+
+            # --- Transient server errors (500/503): short exponential backoff. - #
+            if resp.status_code in (500, 503) and attempt < self._max_retries - 1:
                 last_err = self._strip_key(resp.text, self._api_key)
                 time.sleep(min(2.0 * (2 ** attempt), 60.0))
                 continue
@@ -648,7 +747,7 @@ class GeminiBackend:
             )
 
         raise RuntimeError(
-            f"Gemini request failed after {self._max_retries} attempts: {last_err[:200]}"
+            f"Gemini request failed after {max_attempts} attempts: {last_err[:200]}"
         )
 
 
