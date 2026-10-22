@@ -81,7 +81,7 @@ llm:
   gemini_model: "gemini-3.5-flash-lite"   # lite flash = highest free quota + lowest cost; this account's ListModels has gemini-3.5-flash-lite; if 404 run scripts/list_gemini_models.py and pick another e.g. gemini-2.5-flash, gemini-3.5-flash
   gemini_rpm: 10                          # lowered from 15 to stay under the free-tier per-minute limit; raise on paid tier
   gemini_max_retries: 8                   # 429-aware retries need room: a free-tier per-MINUTE limit clears within ~60s, so the GeminiBackend retries up to this many times honouring the server retryDelay before raising
-  groq_model: "llama-3.1-8b-instant"   # fast, broadly-available Groq model; if 404 'model_not_found', list your account's models with: python -c "import os,requests;r=requests.get('https://api.groq.com/openai/v1/models',headers={'Authorization':'Bearer '+os.environ['GROQ_API_KEY']});print([m['id'] for m in r.json()['data']])"  and pick one (e.g. llama-3.3-70b-versatile, qwen/qwen3-32b).
+  groq_model: "openai/gpt-oss-20b"   # this account's Groq ListModels has openai/gpt-oss-20b (fast, capable); other options: openai/gpt-oss-120b, qwen/qwen3.8-27b. If 404, run the models-list one-liner and pick one.
   groq_rpm: 30                            # Groq free-tier requests-per-minute throttle; raise on a paid tier
   groq_max_retries: 8                     # 429-aware retries honouring the Retry-After header before raising (a per-MINUTE limit clears within ~60s)
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
@@ -400,7 +400,7 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "groq"                    # Groq hosted OpenAI-compatible API (no local GPU)
-      groq_model: "llama-3.1-8b-instant"
+      groq_model: "openai/gpt-oss-20b"
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
