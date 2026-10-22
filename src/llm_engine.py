@@ -521,6 +521,133 @@ class OllamaBackend:
         return parsed
 
 
+class GeminiBackend:
+    """Google Gemini hosted HTTP API backend (CPU-only friendly).
+
+    Calls the Gemini ``generateContent`` v1beta endpoint so the pipeline runs
+    on a CPU-only laptop with no local GPU/model. The API key is read ONLY from
+    the ``GEMINI_API_KEY`` environment variable -- never from config, never
+    hardcoded, never logged.
+
+    Gemini v1beta has no ``seed`` parameter: determinism/caching is handled by
+    the SQLite cache key (which includes ``seed``), so N stochastic passes at
+    T>0 still cache as distinct entries.
+    """
+
+    # Module-wide request throttle (shared across all instances/threads) so we
+    # never exceed the configured requests-per-minute.
+    _throttle_lock = threading.Lock()
+    _last_request_ts = [0.0]  # mutable single-slot timestamp of last dispatch
+
+    # System framing identical in spirit to the HF backend.
+    _SYSTEM = (
+        "You are a strict product-recommendation rater. Always answer in the "
+        "requested 'Reasoning:'/'Score:' format. Never repeat or echo the input."
+    )
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        llm = cfg["llm"]
+        self._model_id = llm.get("gemini_model", "gemini-1.5-flash")
+        self._rmin = float(llm["relevance_min"])
+        self._rmax = float(llm["relevance_max"])
+        self._max_new = int(llm["max_new_tokens"])
+        self._rpm = int(llm.get("gemini_rpm", 15))
+        self._max_retries = int(llm.get("gemini_max_retries", 5))
+        self._timeout = int(llm.get("gemini_timeout", 60))
+        self._api_key = os.environ.get("GEMINI_API_KEY")
+        if not self._api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY environment variable not set. In PowerShell:  "
+                "$env:GEMINI_API_KEY='your-key'   or cmd:  set GEMINI_API_KEY=your-key"
+                "   then re-run."
+            )
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    def _throttle(self) -> None:
+        """Enforce <= self._rpm requests/minute across all threads."""
+        if self._rpm <= 0:
+            return
+        min_interval = 60.0 / float(self._rpm)
+        with GeminiBackend._throttle_lock:
+            now = time.monotonic()
+            wait = GeminiBackend._last_request_ts[0] + min_interval - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            GeminiBackend._last_request_ts[0] = now
+
+    @staticmethod
+    def _strip_key(text: str, key: str) -> str:
+        """Defensive: never let the API key leak into an exception message."""
+        if key:
+            text = text.replace(key, "<redacted>")
+        return text
+
+    def generate(self, prompt: str, temperature: float, seed: int) -> Dict[str, Any]:
+        import requests
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._model_id}:generateContent?key={self._api_key}"
+        )
+        headers = {"Content-Type": "application/json"}
+        full_prompt = self._SYSTEM + "\n\n" + prompt
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": self._max_new,
+            },
+        }
+
+        last_err = ""
+        for attempt in range(self._max_retries):
+            self._throttle()
+            try:
+                resp = requests.post(url, json=body, headers=headers, timeout=self._timeout)
+            except requests.exceptions.RequestException as exc:  # network/timeout
+                last_err = self._strip_key(str(exc), self._api_key)
+                if attempt < self._max_retries - 1:
+                    time.sleep(min(2.0 * (2 ** attempt), 60.0))
+                    continue
+                raise RuntimeError(
+                    f"Gemini request failed after {self._max_retries} attempts: {last_err[:200]}"
+                ) from exc
+
+            if resp.status_code == 200:
+                data = resp.json()
+                text = ""
+                try:
+                    # Defensive: candidates may be missing/empty or blocked
+                    # (finishReason SAFETY etc.) -> leave text="" so
+                    # parse_response falls back to midpoint (parsed_ok False).
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError, TypeError):
+                    text = ""
+                parsed = parse_response(text, self._rmin, self._rmax)
+                parsed["raw"] = text
+                return parsed
+
+            # Retry on transient server/rate-limit statuses.
+            if resp.status_code in (429, 500, 503) and attempt < self._max_retries - 1:
+                last_err = self._strip_key(resp.text, self._api_key)
+                time.sleep(min(2.0 * (2 ** attempt), 60.0))
+                continue
+
+            # Non-retryable, or retries exhausted -> raise (key never included).
+            msg = self._strip_key(resp.text, self._api_key)[:200]
+            raise RuntimeError(
+                f"Gemini API error (HTTP {resp.status_code}): {msg}"
+            )
+
+        raise RuntimeError(
+            f"Gemini request failed after {self._max_retries} attempts: {last_err[:200]}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
@@ -550,8 +677,10 @@ class LLMEngine:
             self._backend = HFBackend(self._cfg)
         elif name == "ollama":
             self._backend = OllamaBackend(self._cfg)
+        elif name == "gemini":
+            self._backend = GeminiBackend(self._cfg)
         else:
-            raise ValueError(f"unknown llm.backend: {name!r} (expected mock/hf/ollama)")
+            raise ValueError(f"unknown llm.backend: {name!r} (expected mock/hf/ollama/gemini)")
 
     @property
     def model_id(self) -> str:
@@ -561,6 +690,8 @@ class LLMEngine:
             return self._cfg["llm"]["hf_model"]
         if self._backend_name == "ollama":
             return self._cfg["llm"]["ollama_model"]
+        if self._backend_name == "gemini":
+            return self._cfg["llm"].get("gemini_model", "gemini-1.5-flash")
         return self._backend_name
 
     def _cache_key(self, prompt: str, temperature: float, seed: int) -> str:
