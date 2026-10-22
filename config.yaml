@@ -78,7 +78,7 @@ llm:
   hf_model: "Qwen/Qwen2.5-3B-Instruct"   # fallback: mistralai/Mistral-7B-Instruct-v0.2
   ollama_model: "qwen2.5:3b"
   ollama_url: "http://localhost:11434"
-  gemini_model: "gemini-1.5-flash"       # Google Gemini hosted API model (CPU-only path; key from $GEMINI_API_KEY only)
+  gemini_model: "gemini-2.0-flash"       # current fast model; if you get HTTP 404 'model not found', run ListModels and set a name your key supports (e.g. gemini-2.0-flash, gemini-flash-latest, gemini-2.5-flash)
   gemini_rpm: 15                          # free tier ~15 req/min; raise on paid tier
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
@@ -351,7 +351,7 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "gemini"                  # Google Gemini hosted API (no local GPU)
-      gemini_model: "gemini-1.5-flash"
+      gemini_model: "gemini-2.0-flash"
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls

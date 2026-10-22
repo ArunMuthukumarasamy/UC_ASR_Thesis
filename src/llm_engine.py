@@ -547,7 +547,11 @@ class GeminiBackend:
 
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         llm = cfg["llm"]
-        self._model_id = llm.get("gemini_model", "gemini-1.5-flash")
+        # Normalize the model id: strip a leading "models/" prefix if present so
+        # both "gemini-2.0-flash" and "models/gemini-2.0-flash" work (ListModels
+        # returns names with the prefix, the endpoint path adds it back).
+        mid = str(llm.get("gemini_model", "gemini-2.0-flash"))
+        self._model_id = mid[len("models/"):] if mid.startswith("models/") else mid
         self._rmin = float(llm["relevance_min"])
         self._rmax = float(llm["relevance_max"])
         self._max_new = int(llm["max_new_tokens"])
