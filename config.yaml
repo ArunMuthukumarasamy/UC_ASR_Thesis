@@ -491,17 +491,17 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "hf"                      # local HuggingFace transformers on CPU (no GPU, no API)
-      hf_model: "Qwen/Qwen2.5-1.5B-Instruct"  # small + CPU-viable; fallback Qwen2.5-0.5B-Instruct if RAM/time is tight
+      hf_model: "Qwen/Qwen2.5-0.5B-Instruct"  # 0.5B: ~3x faster per token than 1.5B on CPU, still gives usable Reasoning+Score. Bump to 1.5B if you want stronger judgments and can spare the extra days.
       load_in_4bit: false                # no CUDA on this machine -> float32 CPU path (NIT-2)
       dtype: "float32"
       device: "cpu"
-      max_new_tokens: 256                # enough for Reasoning + Score without truncation; keep >=256 so ATM trace clustering has signal
+      max_new_tokens: 96                 # the answer is ~1 sentence + a number; 96 keeps CPU per-call time low while still long enough for ATM trace clustering. Raise toward 256 for richer traces at the cost of more time.
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save a full extra LLM pass
     evaluation:
       figure_dpi: 300
-      local_max_eval_users: 50           # full-ish eval set; CPU is slow but unlimited, so this runs overnight. _resolve_cap picks this up via the "*max_eval_users" suffix.
-      local_max_ablation_users: 20       # tighter cap for the ablations to keep the overnight run bounded
+      local_max_eval_users: 8            # OVERNIGHT-sized: ~8 users * ~230 unique calls * ~60s/call ~= a night on CPU. Small sample -> accuracy metrics are noisy; the UC-ASR MECHANISM results (gate tiers, CR, call savings, stability) are the defensible output here. Raise once you have a faster LLM path (e.g. Cerebras). _resolve_cap picks this up via the "*max_eval_users" suffix.
+      local_max_ablation_users: 4        # tighter cap for the ablations to keep the overnight run bounded
     ablations:                           # SAME 3 uncertainty-critical ablations as gemini/groq/kaggle_unc
       - name: "no_uncertainty_term"
         desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
