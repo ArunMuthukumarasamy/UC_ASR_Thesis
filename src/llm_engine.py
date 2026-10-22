@@ -751,6 +751,221 @@ class GeminiBackend:
         )
 
 
+class GroqBackend:
+    """Groq hosted OpenAI-compatible chat-completions backend (CPU-only friendly).
+
+    Calls the Groq ``/openai/v1/chat/completions`` endpoint so the pipeline runs
+    on a CPU-only laptop with no local GPU/model, using Groq's fast + generous
+    free-tier hosted inference. The API key is read ONLY from the
+    ``GROQ_API_KEY`` environment variable -- never from config, never hardcoded,
+    never logged, never included in an exception message.
+
+    Groq's OpenAI-compatible API accepts an optional ``seed`` field, which is
+    included below for reproducibility; the SQLite cache key also includes
+    ``seed`` so N stochastic passes at T>0 cache as distinct entries.
+    """
+
+    _ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+
+    # Module-wide request throttle (SEPARATE from Gemini's) so Groq's own
+    # requests-per-minute limit is enforced across all instances/threads.
+    _throttle_lock = threading.Lock()
+    _last_request_ts = [0.0]  # mutable single-slot timestamp of last dispatch
+
+    # Log the FIRST 429 body (key-stripped, truncated) exactly once per process
+    # so the user can see whether a per-MINUTE vs per-DAY limit was hit.
+    _logged_429 = False
+
+    # 429-specific backoff (same shape as GeminiBackend): per-minute limits
+    # clear within ~60s, so allow more attempts and a higher cap than the
+    # transient 500/502/503 path.
+    _MAX_429_ATTEMPTS = 8
+    _BACKOFF_429_BASE = 5.0
+    _BACKOFF_429_CAP = 120.0
+
+    # System framing identical in spirit to the HF/Gemini backends.
+    _SYSTEM = (
+        "You are a strict product-recommendation rater. Always answer in the "
+        "requested 'Reasoning:'/'Score:' format. Never repeat or echo the input."
+    )
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        llm = cfg["llm"]
+        self._model_id = str(llm.get("groq_model", "llama-3.3-70b-versatile"))
+        self._rmin = float(llm["relevance_min"])
+        self._rmax = float(llm["relevance_max"])
+        self._max_new = int(llm["max_new_tokens"])
+        self._rpm = int(llm.get("groq_rpm", 30))
+        self._max_retries = int(llm.get("groq_max_retries", 8))
+        self._timeout = int(llm.get("groq_timeout", 60))
+        self._api_key = os.environ.get("GROQ_API_KEY")
+        if not self._api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY environment variable not set. In PowerShell:  "
+                "$env:GROQ_API_KEY='gsk_...'   or cmd:  set GROQ_API_KEY=gsk_..."
+                "   then re-run."
+            )
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    def _throttle(self) -> None:
+        """Enforce <= self._rpm requests/minute across all threads (Groq-only)."""
+        if self._rpm <= 0:
+            return
+        min_interval = 60.0 / float(self._rpm)
+        with GroqBackend._throttle_lock:
+            now = time.monotonic()
+            wait = GroqBackend._last_request_ts[0] + min_interval - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            GroqBackend._last_request_ts[0] = now
+
+    @staticmethod
+    def _strip_key(text: str, key: str) -> str:
+        """Defensive: never let the API key leak into an exception message."""
+        if key:
+            text = text.replace(key, "<redacted>")
+        return text
+
+    @classmethod
+    def _log_first_429(cls, stripped_body: str) -> None:
+        """One-time INFO log of the first 429 body so the quota metric is visible."""
+        if cls._logged_429:
+            return
+        cls._logged_429 = True
+        log.info(
+            "First Groq HTTP 429 body (key-stripped, first 300 chars) -- look for "
+            "'per minute'/'RPM' (clears within ~60s) vs 'per day'/'RPD' (daily "
+            "free-tier quota): %s",
+            stripped_body[:300],
+        )
+
+    @staticmethod
+    def _parse_retry_after(resp) -> Optional[float]:
+        """Extract a server-suggested retry delay (seconds) from a 429 response.
+
+        Groq sets a ``Retry-After`` header (seconds, possibly fractional).
+        Returns the delay in seconds, or ``None`` when absent/unparseable.
+        """
+        try:
+            hdr = resp.headers.get("Retry-After")
+            if hdr is not None:
+                m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$", str(hdr))
+                if m:
+                    return float(m.group(1))
+        except (AttributeError, TypeError):
+            pass
+        return None
+
+    def generate(self, prompt: str, temperature: float, seed: int) -> Dict[str, Any]:
+        import requests
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        messages = [
+            {"role": "system", "content": self._SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        body = {
+            "model": self._model_id,
+            "messages": messages,
+            "temperature": float(temperature),
+            "max_tokens": self._max_new,
+            # Groq supports an optional seed for reproducibility; the SQLite
+            # cache key already includes seed too.
+            "seed": int(seed),
+        }
+
+        # 429 gets its own, more generous attempt budget and Retry-After-aware
+        # sleeps (per-minute free-tier limits clear in ~60s); transient
+        # 500/502/503 keep the shorter exponential backoff. The total budget is
+        # the larger of the two so neither path is starved.
+        max_429 = max(self._max_retries, GroqBackend._MAX_429_ATTEMPTS)
+        max_attempts = max(self._max_retries, max_429)
+
+        last_err = ""
+        attempts_429 = 0
+        for attempt in range(max_attempts):
+            self._throttle()
+            try:
+                resp = requests.post(
+                    self._ENDPOINT, json=body, headers=headers, timeout=self._timeout
+                )
+            except requests.exceptions.RequestException as exc:  # network/timeout
+                last_err = self._strip_key(str(exc), self._api_key)
+                if attempt < self._max_retries - 1:
+                    time.sleep(min(2.0 * (2 ** attempt), 60.0))
+                    continue
+                raise RuntimeError(
+                    f"Groq request failed after {self._max_retries} attempts: {last_err[:200]}"
+                ) from exc
+
+            if resp.status_code == 200:
+                data = resp.json()
+                text = ""
+                try:
+                    # Defensive: shape may be unexpected/empty -> leave text=""
+                    # so parse_response falls back to midpoint (parsed_ok False).
+                    text = data["choices"][0]["message"]["content"]
+                    if text is None:
+                        text = ""
+                except (KeyError, IndexError, TypeError):
+                    text = ""
+                parsed = parse_response(text, self._rmin, self._rmax)
+                parsed["raw"] = text
+                return parsed
+
+            # --- Rate-limit / quota (429): honour Retry-After header. --------- #
+            if resp.status_code == 429:
+                stripped = self._strip_key(resp.text, self._api_key)
+                last_err = stripped
+                self._log_first_429(stripped)
+                attempts_429 += 1
+                if attempts_429 < max_429:
+                    delay = self._parse_retry_after(resp)
+                    if delay is not None:
+                        sleep_s = min(max(delay, 0.0), GroqBackend._BACKOFF_429_CAP)
+                    else:
+                        sleep_s = min(
+                            GroqBackend._BACKOFF_429_BASE * (2 ** (attempts_429 - 1)),
+                            GroqBackend._BACKOFF_429_CAP,
+                        )
+                    log.warning(
+                        "Groq HTTP 429 (attempt %d/%d); sleeping %.1fs before retry.",
+                        attempts_429, max_429, sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                # 429 retries exhausted -> explicit, cause-revealing error.
+                raise RuntimeError(
+                    f"Groq rate limit / quota exceeded (HTTP 429) after {attempts_429} "
+                    "retries. A per-MINUTE limit clears within ~60s (just wait and re-run, "
+                    "the SQLite cache resumes); a per-DAY free-tier quota needs a longer "
+                    "wait. Consider switching to a smaller/faster model (groq_model: "
+                    "llama-3.1-8b-instant) or lowering llm.groq_rpm. Raw: "
+                    f"{stripped[:300]}"
+                )
+
+            # --- Transient server errors (500/502/503): short backoff. -------- #
+            if resp.status_code in (500, 502, 503) and attempt < self._max_retries - 1:
+                last_err = self._strip_key(resp.text, self._api_key)
+                time.sleep(min(2.0 * (2 ** attempt), 60.0))
+                continue
+
+            # Non-retryable, or retries exhausted -> raise (key never included).
+            msg = self._strip_key(resp.text, self._api_key)[:200]
+            raise RuntimeError(f"Groq API error (HTTP {resp.status_code}): {msg}")
+
+        raise RuntimeError(
+            f"Groq request failed after {max_attempts} attempts: {last_err[:200]}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
@@ -782,8 +997,12 @@ class LLMEngine:
             self._backend = OllamaBackend(self._cfg)
         elif name == "gemini":
             self._backend = GeminiBackend(self._cfg)
+        elif name == "groq":
+            self._backend = GroqBackend(self._cfg)
         else:
-            raise ValueError(f"unknown llm.backend: {name!r} (expected mock/hf/ollama/gemini)")
+            raise ValueError(
+                f"unknown llm.backend: {name!r} (expected mock/hf/ollama/gemini/groq)"
+            )
 
     @property
     def model_id(self) -> str:
@@ -795,6 +1014,8 @@ class LLMEngine:
             return self._cfg["llm"]["ollama_model"]
         if self._backend_name == "gemini":
             return self._cfg["llm"].get("gemini_model", "gemini-1.5-flash")
+        if self._backend_name == "groq":
+            return self._cfg["llm"].get("groq_model", "llama-3.3-70b-versatile")
         return self._backend_name
 
     def _cache_key(self, prompt: str, temperature: float, seed: int) -> str:

@@ -81,6 +81,9 @@ llm:
   gemini_model: "gemini-3.5-flash-lite"   # lite flash = highest free quota + lowest cost; this account's ListModels has gemini-3.5-flash-lite; if 404 run scripts/list_gemini_models.py and pick another e.g. gemini-2.5-flash, gemini-3.5-flash
   gemini_rpm: 10                          # lowered from 15 to stay under the free-tier per-minute limit; raise on paid tier
   gemini_max_retries: 8                   # 429-aware retries need room: a free-tier per-MINUTE limit clears within ~60s, so the GeminiBackend retries up to this many times honouring the server retryDelay before raising
+  groq_model: "llama-3.3-70b-versatile"   # Groq OpenAI-compatible; fast + generous free tier; other options: llama-3.1-8b-instant, qwen/qwen3-32b
+  groq_rpm: 30                            # Groq free-tier requests-per-minute throttle; raise on a paid tier
+  groq_max_retries: 8                     # 429-aware retries honouring the Retry-After header before raising (a per-MINUTE limit clears within ~60s)
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
   device: "auto"                   # "auto" -> cuda if available else cpu
@@ -366,6 +369,49 @@ scales:
       gemini_max_ablation_users: 10      # tighter cap for the ablations; start small on the
                                          # free-tier daily budget and raise once confirmed/on billing
     ablations:                           # SAME 3 uncertainty-critical ablations as kaggle_unc
+      - name: "no_uncertainty_term"
+        desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
+        override: { rerankers: { uc_asr: { gamma: 0.0 } } }
+      - name: "no_cluster_ratio_term"
+        desc: "UC-ASR beta=0 (drop beta*CR)"
+        override: { rerankers: { uc_asr: { beta: 0.0 } } }
+      - name: "gate_off_fixed_n3"
+        desc: "gate off -> fixed N=3 everywhere (UARO-like)"
+        override: {}
+
+  # --- Groq CPU-laptop-via-API profile: run the WHOLE pipeline on a CPU-only
+  #     laptop by calling Groq's hosted OpenAI-compatible API instead of a local
+  #     GPU model. Groq is fast with a generous free tier, so this mirrors the
+  #     `gemini` profile's modeling knobs (10k-user 5-core dense graph, full
+  #     50-epoch BPR-MF + LightGCN, K=50 candidates, N=3 stochastic passes @
+  #     T=0.7, 300-DPI figures) but routes the LLM through Groq. The API key is
+  #     read ONLY from $GROQ_API_KEY -- never config.
+  groq:
+    project:
+      seeds: [42]                        # single seed (the uncertainty mechanism is valid on one seed)
+    preprocessing:
+      n_users_subset: 10000
+      k_core: 5
+    retrievers:
+      top_k_candidates: 50
+      bpr_mf: { epochs: 50 }
+      lightgcn: { epochs: 50 }
+    uncertainty:
+      uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
+    llm:
+      backend: "groq"                    # Groq hosted OpenAI-compatible API (no local GPU)
+      groq_model: "llama-3.3-70b-versatile"
+      device: "cpu"
+    rerankers:
+      uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
+    evaluation:
+      figure_dpi: 300
+      groq_max_eval_users: 50            # Groq's free tier is generous, so 50 is reasonable;
+                                         # raise once a run confirms the budget holds, or on a
+                                         # paid tier (the SQLite cache resumes). _resolve_cap
+                                         # picks this up via the "*max_eval_users" suffix.
+      groq_max_ablation_users: 20        # tighter cap for the ablations; can be raised likewise
+    ablations:                           # SAME 3 uncertainty-critical ablations as gemini/kaggle_unc
       - name: "no_uncertainty_term"
         desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
         override: { rerankers: { uc_asr: { gamma: 0.0 } } }
