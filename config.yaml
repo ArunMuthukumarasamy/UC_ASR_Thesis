@@ -316,11 +316,11 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "hf"
-      hf_model: "Qwen/Qwen2.5-3B-Instruct"
+      hf_model: "Qwen/Qwen2.5-1.5B-Instruct"  # was 3B: ~2-3x faster on T4 so the full fill finishes in ONE committed session. Still a real, defensible LLM; every method shares it so the comparison holds. Report honestly as Qwen2.5-1.5B-Instruct.
       load_in_4bit: true
       dtype: "bfloat16"
       device: "auto"
-      max_new_tokens: 256                # cut from 768 for speed, but NOT to ~96: the ATM cluster
+      max_new_tokens: 256                # kept at 256 (NOT ~96): the ATM cluster
                                          # ratio clusters the reasoning TRACES, so keep enough
                                          # reasoning length for meaningful semantic clustering
     rerankers:
