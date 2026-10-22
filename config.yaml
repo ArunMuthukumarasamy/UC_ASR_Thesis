@@ -78,7 +78,7 @@ llm:
   hf_model: "Qwen/Qwen2.5-3B-Instruct"   # fallback: mistralai/Mistral-7B-Instruct-v0.2
   ollama_model: "qwen2.5:3b"
   ollama_url: "http://localhost:11434"
-  gemini_model: "gemini-2.5-flash-lite"   # gemini-2.5-flash-lite has the most generous free-tier quota and lowest cost, best for many calls; if 404 run scripts/list_gemini_models.py.
+  gemini_model: "gemini-3.5-flash-lite"   # lite flash = highest free quota + lowest cost; this account's ListModels has gemini-3.5-flash-lite; if 404 run scripts/list_gemini_models.py and pick another e.g. gemini-2.5-flash, gemini-3.5-flash
   gemini_rpm: 10                          # lowered from 15 to stay under the free-tier per-minute limit; raise on paid tier
   gemini_max_retries: 8                   # 429-aware retries need room: a free-tier per-MINUTE limit clears within ~60s, so the GeminiBackend retries up to this many times honouring the server retryDelay before raising
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
@@ -352,7 +352,7 @@ scales:
       uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
     llm:
       backend: "gemini"                  # Google Gemini hosted API (no local GPU)
-      gemini_model: "gemini-2.5-flash-lite"
+      gemini_model: "gemini-3.5-flash-lite"
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
