@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -223,19 +224,27 @@ def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
 
     # (b) Score search, first branch to produce an in-range value wins.
 
-    # 1. Explicit "Score:" marker -> take the LAST match (the final line).
+    # 1. Explicit "Score:" marker -> take the LAST match (the final line). An
+    #    explicit score the model deliberately wrote is a real judgement even
+    #    when out of range, so CLAMP it to [rmin,rmax] rather than discard it
+    #    (e.g. 7 -> rmax, 30 -> rmax, 0 -> rmin, -2 -> rmin). Only the absence
+    #    of any Score: match falls through to the next branch.
     score_matches = _SCORE_RE.findall(text)
     for raw in reversed(score_matches):
-        num = max(rmin, min(rmax, float(raw)))
-        if rmin <= float(raw) <= rmax:
+        val = float(raw)
+        if math.isfinite(val):
+            num = max(rmin, min(rmax, val))
             return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
 
-    # 2. Legacy "Relevance:" marker -> LAST in-range match. The regex requires
-    #    a digit, so "Relevance: .a" never matches here.
+    # 2. Legacy "Relevance:" marker -> LAST match, clamped (same rationale as
+    #    the Score: branch). The regex requires a digit, so "Relevance: .a"
+    #    never matches here.
     rel_matches = _RELEVANCE_RE.findall(text)
-    valid_rel = [float(x) for x in rel_matches if rmin <= float(x) <= rmax]
-    if valid_rel:
-        return {"reasoning": reasoning, "relevance": float(valid_rel[-1]), "parsed_ok": True}
+    for raw in reversed(rel_matches):
+        val = float(raw)
+        if math.isfinite(val):
+            num = max(rmin, min(rmax, val))
+            return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
 
     # 3. Fraction / "out of 5" phrasings anywhere in the text. A denominator
     #    of 5 means the numerator is the score; other denominators are skipped
