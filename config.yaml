@@ -83,6 +83,7 @@ llm:
   gemini_max_retries: 8                   # 429-aware retries need room: a free-tier per-MINUTE limit clears within ~60s, so the GeminiBackend retries up to this many times honouring the server retryDelay before raising
   groq_model: "openai/gpt-oss-20b"   # this account's Groq ListModels has openai/gpt-oss-20b (fast, capable); other options: openai/gpt-oss-120b, qwen/qwen3.8-27b. If 404, run the models-list one-liner and pick one.
   groq_rpm: 30                            # Groq free-tier requests-per-minute throttle; raise on a paid tier
+  groq_tpm: 8000                          # Groq free-tier TOKENS-per-minute budget; the token-aware throttle keeps estimated (prompt+max_new) tokens under this in any trailing 60s window so steady-state almost never 429s. Raise on a paid/dev tier.
   groq_max_retries: 8                     # 429-aware retries honouring the Retry-After header before raising (a per-MINUTE limit clears within ~60s)
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
@@ -401,6 +402,7 @@ scales:
     llm:
       backend: "groq"                    # Groq hosted OpenAI-compatible API (no local GPU)
       groq_model: "openai/gpt-oss-20b"
+      max_new_tokens: 128                # override the base 768: the Reasoning+Score answer is ~1-2 sentences + a number, so 128 is plenty and roughly thirds the per-call token cost. Smaller calls fit more comfortably under Groq's 8000 TPM free-tier budget -> far fewer 429s.
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls

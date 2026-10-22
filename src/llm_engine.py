@@ -28,6 +28,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from typing import Any, Dict, List, Mapping, Optional
 
 from src.common import Config, get_logger, load_config, resolve_path
@@ -772,6 +773,16 @@ class GroqBackend:
     _throttle_lock = threading.Lock()
     _last_request_ts = [0.0]  # mutable single-slot timestamp of last dispatch
 
+    # Module-wide rolling-window TOKEN budget. Groq's free tier caps
+    # tokens-per-minute (TPM), not just requests-per-minute, so a pure RPM
+    # throttle vastly overshoots an 8000-TPM budget and nearly every call 429s.
+    # We track (monotonic_ts, estimated_tokens) of recent dispatches in a
+    # trailing-60s window and, before each request, sleep until adding this
+    # call's estimated cost keeps the window total <= self._tpm. Guarded by the
+    # SAME _throttle_lock so RPM and TPM limiters are consistent across threads.
+    _TOKEN_WINDOW_S = 60.0
+    _token_events: "deque[tuple[float, int]]" = deque()  # (ts, est_tokens)
+
     # Log the FIRST 429 body (key-stripped, truncated) exactly once per process
     # so the user can see whether a per-MINUTE vs per-DAY limit was hit.
     _logged_429 = False
@@ -796,6 +807,7 @@ class GroqBackend:
         self._rmax = float(llm["relevance_max"])
         self._max_new = int(llm["max_new_tokens"])
         self._rpm = int(llm.get("groq_rpm", 30))
+        self._tpm = int(llm.get("groq_tpm", 8000))
         self._max_retries = int(llm.get("groq_max_retries", 8))
         self._timeout = int(llm.get("groq_timeout", 60))
         self._api_key = os.environ.get("GROQ_API_KEY")
@@ -810,18 +822,81 @@ class GroqBackend:
     def model_id(self) -> str:
         return self._model_id
 
-    def _throttle(self) -> None:
-        """Enforce <= self._rpm requests/minute across all threads (Groq-only)."""
-        if self._rpm <= 0:
+    @staticmethod
+    def _prune_token_window(now: float) -> int:
+        """Drop token events older than the trailing 60s; return tokens still in-window.
+
+        MUST be called while holding ``_throttle_lock``.
+        """
+        cutoff = now - GroqBackend._TOKEN_WINDOW_S
+        events = GroqBackend._token_events
+        while events and events[0][0] <= cutoff:
+            events.popleft()
+        return sum(tok for _, tok in events)
+
+    def _estimate_tokens(self, prompt: str) -> int:
+        """Cheap per-call token estimate: prompt tokens (~4 chars/token) + output reserve.
+
+        Pre-request estimation (not the real ``resp`` usage) is what prevents
+        429s, so we deliberately over-count by reserving the full ``max_new``
+        output budget on top of the prompt estimate.
+        """
+        prompt_tokens = max(1, len(prompt) // 4)  # ~4 chars/token
+        return prompt_tokens + int(self._max_new)
+
+    def _throttle_tokens(self, est_tokens: int) -> None:
+        """Rolling-window TOKEN limiter: stay <= self._tpm within any trailing 60s.
+
+        Before dispatch, if adding this call's estimated cost would exceed the
+        budget, sleep just long enough for the oldest in-window events to age
+        out past 60s, then record the estimated tokens at dispatch time. No-op
+        when ``self._tpm <= 0`` (disabled).
+        """
+        if self._tpm <= 0:
             return
-        min_interval = 60.0 / float(self._rpm)
         with GroqBackend._throttle_lock:
             now = time.monotonic()
-            wait = GroqBackend._last_request_ts[0] + min_interval - now
-            if wait > 0:
+            in_window = self._prune_token_window(now)
+            # Sleep until enough of the window has elapsed to fit est_tokens.
+            # A single call bigger than the whole budget still proceeds (we
+            # drain the window first) rather than deadlock.
+            while GroqBackend._token_events and in_window + est_tokens > self._tpm:
+                oldest_ts = GroqBackend._token_events[0][0]
+                wait = oldest_ts + GroqBackend._TOKEN_WINDOW_S - now
+                if wait <= 0:
+                    now = time.monotonic()
+                    in_window = self._prune_token_window(now)
+                    continue
+                log.info(
+                    "Groq TPM throttle: in-window=%d + est=%d > budget=%d; "
+                    "sleeping %.2fs for the 60s window to drain.",
+                    in_window, est_tokens, self._tpm, wait,
+                )
                 time.sleep(wait)
                 now = time.monotonic()
-            GroqBackend._last_request_ts[0] = now
+                in_window = self._prune_token_window(now)
+            GroqBackend._token_events.append((now, int(est_tokens)))
+
+    def _throttle(self, est_tokens: Optional[int] = None) -> None:
+        """Enforce BOTH the per-minute REQUEST and per-minute TOKEN budgets.
+
+        Whichever limiter is stricter wins (each may sleep). ``est_tokens``, when
+        provided, drives the rolling-window token budget; pass it on every real
+        dispatch so steady-state stays under Groq's TPM free-tier limit.
+        """
+        # --- Request rate limiter (RPM) --------------------------------------- #
+        if self._rpm > 0:
+            min_interval = 60.0 / float(self._rpm)
+            with GroqBackend._throttle_lock:
+                now = time.monotonic()
+                wait = GroqBackend._last_request_ts[0] + min_interval - now
+                if wait > 0:
+                    time.sleep(wait)
+                    now = time.monotonic()
+                GroqBackend._last_request_ts[0] = now
+        # --- Token budget limiter (TPM) --------------------------------------- #
+        if est_tokens is not None:
+            self._throttle_tokens(est_tokens)
 
     @staticmethod
     def _strip_key(text: str, key: str) -> str:
@@ -843,13 +918,34 @@ class GroqBackend:
             stripped_body[:300],
         )
 
-    @staticmethod
-    def _parse_retry_after(resp) -> Optional[float]:
+    # "...try again in 937.5ms" / "...try again in 1.2s" appears in the Groq 429
+    # error MESSAGE body (not always the Retry-After header). This precise,
+    # often sub-second hint beats the generic exponential backoff.
+    _RETRY_IN_RE = re.compile(
+        r"try\s+again\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)\b", re.IGNORECASE
+    )
+
+    @classmethod
+    def _parse_retry_after(cls, resp) -> Optional[float]:
         """Extract a server-suggested retry delay (seconds) from a 429 response.
 
-        Groq sets a ``Retry-After`` header (seconds, possibly fractional).
-        Returns the delay in seconds, or ``None`` when absent/unparseable.
+        Prefers the precise ``"try again in Xms"/"try again in Xs"`` hint in the
+        response BODY (Groq puts the sub-second delay there), then falls back to
+        the ``Retry-After`` header (seconds, possibly fractional). Returns the
+        delay in seconds, or ``None`` when absent/unparseable.
         """
+        # 1) Precise body hint: "try again in 937.5ms" / "try again in 1.2s".
+        try:
+            body = resp.text
+            if body:
+                m = cls._RETRY_IN_RE.search(str(body))
+                if m:
+                    value = float(m.group(1))
+                    unit = m.group(2).lower()
+                    return value / 1000.0 if unit == "ms" else value
+        except (AttributeError, TypeError, ValueError):
+            pass
+        # 2) Fallback: numeric Retry-After header (seconds).
         try:
             hdr = resp.headers.get("Retry-After")
             if hdr is not None:
@@ -888,10 +984,15 @@ class GroqBackend:
         max_429 = max(self._max_retries, GroqBackend._MAX_429_ATTEMPTS)
         max_attempts = max(self._max_retries, max_429)
 
+        # Pre-request token-cost estimate (prompt ~4 chars/token + output
+        # reserve). Drives the rolling-window TPM throttle so we stay under
+        # Groq's free-tier tokens/min budget and almost never 429.
+        est_tokens = self._estimate_tokens(prompt)
+
         last_err = ""
         attempts_429 = 0
         for attempt in range(max_attempts):
-            self._throttle()
+            self._throttle(est_tokens)
             try:
                 resp = requests.post(
                     self._ENDPOINT, json=body, headers=headers, timeout=self._timeout
@@ -929,14 +1030,18 @@ class GroqBackend:
                 if attempts_429 < max_429:
                     delay = self._parse_retry_after(resp)
                     if delay is not None:
-                        sleep_s = min(max(delay, 0.0), GroqBackend._BACKOFF_429_CAP)
+                        # Honour the server's precise hint + a small cushion so
+                        # we clear the window edge rather than racing it.
+                        sleep_s = min(
+                            max(delay, 0.0) + 0.25, GroqBackend._BACKOFF_429_CAP
+                        )
                     else:
                         sleep_s = min(
                             GroqBackend._BACKOFF_429_BASE * (2 ** (attempts_429 - 1)),
                             GroqBackend._BACKOFF_429_CAP,
                         )
                     log.warning(
-                        "Groq HTTP 429 (attempt %d/%d); sleeping %.1fs before retry.",
+                        "Groq HTTP 429 (attempt %d/%d); sleeping %.2fs before retry.",
                         attempts_429, max_429, sleep_s,
                     )
                     time.sleep(sleep_s)
