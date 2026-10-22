@@ -822,14 +822,15 @@ class GroqBackend:
     def model_id(self) -> str:
         return self._model_id
 
-    @staticmethod
-    def _prune_token_window(now: float) -> int:
+    @classmethod
+    def _prune_token_window(cls, now: float) -> int:
         """Drop token events older than the trailing 60s; return tokens still in-window.
 
-        MUST be called while holding ``_throttle_lock``.
+        MUST be called while holding ``_throttle_lock``. Uses ``cls`` state so a
+        subclass (e.g. CerebrasBackend) prunes its OWN token window.
         """
-        cutoff = now - GroqBackend._TOKEN_WINDOW_S
-        events = GroqBackend._token_events
+        cutoff = now - cls._TOKEN_WINDOW_S
+        events = cls._token_events
         while events and events[0][0] <= cutoff:
             events.popleft()
         return sum(tok for _, tok in events)
@@ -854,14 +855,14 @@ class GroqBackend:
         """
         if self._tpm <= 0:
             return
-        with GroqBackend._throttle_lock:
+        with type(self)._throttle_lock:
             now = time.monotonic()
             in_window = self._prune_token_window(now)
             # Sleep until enough of the window has elapsed to fit est_tokens.
             # A single call bigger than the whole budget still proceeds (we
             # drain the window first) rather than deadlock.
-            while GroqBackend._token_events and in_window + est_tokens > self._tpm:
-                oldest_ts = GroqBackend._token_events[0][0]
+            while type(self)._token_events and in_window + est_tokens > self._tpm:
+                oldest_ts = type(self)._token_events[0][0]
                 wait = oldest_ts + GroqBackend._TOKEN_WINDOW_S - now
                 if wait <= 0:
                     now = time.monotonic()
@@ -875,7 +876,7 @@ class GroqBackend:
                 time.sleep(wait)
                 now = time.monotonic()
                 in_window = self._prune_token_window(now)
-            GroqBackend._token_events.append((now, int(est_tokens)))
+            type(self)._token_events.append((now, int(est_tokens)))
 
     def _throttle(self, est_tokens: Optional[int] = None) -> None:
         """Enforce BOTH the per-minute REQUEST and per-minute TOKEN budgets.
@@ -887,13 +888,13 @@ class GroqBackend:
         # --- Request rate limiter (RPM) --------------------------------------- #
         if self._rpm > 0:
             min_interval = 60.0 / float(self._rpm)
-            with GroqBackend._throttle_lock:
+            with type(self)._throttle_lock:
                 now = time.monotonic()
-                wait = GroqBackend._last_request_ts[0] + min_interval - now
+                wait = type(self)._last_request_ts[0] + min_interval - now
                 if wait > 0:
                     time.sleep(wait)
                     now = time.monotonic()
-                GroqBackend._last_request_ts[0] = now
+                type(self)._last_request_ts[0] = now
         # --- Token budget limiter (TPM) --------------------------------------- #
         if est_tokens is not None:
             self._throttle_tokens(est_tokens)
@@ -1071,6 +1072,48 @@ class GroqBackend:
         )
 
 
+class CerebrasBackend(GroqBackend):
+    """Cerebras hosted OpenAI-compatible chat-completions backend.
+
+    Cerebras' inference API is OpenAI-compatible, so this reuses GroqBackend's
+    entire machinery (rolling-window RPM+TPM throttle, 429 Retry-After handling,
+    response parsing) and overrides only: the endpoint, the API key env var, the
+    model/throttle config keys, and -- importantly -- its OWN module-wide throttle
+    state (lock + request timestamp + token window) so Cerebras pacing is tracked
+    SEPARATELY from Groq's. Free tier: ~1M tokens/day, ~5 RPM, very fast inference.
+    The API key is read ONLY from $CEREBRAS_API_KEY -- never config/chat/git.
+    """
+
+    _ENDPOINT = "https://api.cerebras.ai/v1/chat/completions"
+
+    # SEPARATE module-wide throttle state (do NOT share Groq's class attrs).
+    _throttle_lock = threading.Lock()
+    _last_request_ts = [0.0]
+    _token_events: "deque[tuple[float, int]]" = deque()
+    _logged_429 = False
+
+    def __init__(self, cfg: Mapping[str, Any]) -> None:
+        llm = cfg["llm"]
+        self._model_id = str(llm.get("cerebras_model", "llama-3.3-70b"))
+        self._rmin = float(llm["relevance_min"])
+        self._rmax = float(llm["relevance_max"])
+        self._max_new = int(llm["max_new_tokens"])
+        # Free tier is ~5 RPM and ~1M tokens/day. We pace on a per-MINUTE token
+        # window (same mechanism as Groq); default the per-minute token budget
+        # conservatively so steady-state stays well under the daily cap.
+        self._rpm = int(llm.get("cerebras_rpm", 5))
+        self._tpm = int(llm.get("cerebras_tpm", 60000))
+        self._max_retries = int(llm.get("cerebras_max_retries", 8))
+        self._timeout = int(llm.get("cerebras_timeout", 60))
+        self._api_key = os.environ.get("CEREBRAS_API_KEY")
+        if not self._api_key:
+            raise RuntimeError(
+                "CEREBRAS_API_KEY environment variable not set. In PowerShell:  "
+                "$env:CEREBRAS_API_KEY='csk-...'   or cmd:  set CEREBRAS_API_KEY=csk-..."
+                "   then re-run."
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
@@ -1104,9 +1147,12 @@ class LLMEngine:
             self._backend = GeminiBackend(self._cfg)
         elif name == "groq":
             self._backend = GroqBackend(self._cfg)
+        elif name == "cerebras":
+            self._backend = CerebrasBackend(self._cfg)
         else:
             raise ValueError(
-                f"unknown llm.backend: {name!r} (expected mock/hf/ollama/gemini/groq)"
+                f"unknown llm.backend: {name!r} "
+                "(expected mock/hf/ollama/gemini/groq/cerebras)"
             )
 
     @property
@@ -1121,6 +1167,8 @@ class LLMEngine:
             return self._cfg["llm"].get("gemini_model", "gemini-1.5-flash")
         if self._backend_name == "groq":
             return self._cfg["llm"].get("groq_model", "llama-3.3-70b-versatile")
+        if self._backend_name == "cerebras":
+            return self._cfg["llm"].get("cerebras_model", "llama-3.3-70b")
         return self._backend_name
 
     def _cache_key(self, prompt: str, temperature: float, seed: int) -> str:

@@ -85,6 +85,10 @@ llm:
   groq_rpm: 30                            # Groq free-tier requests-per-minute throttle; raise on a paid tier
   groq_tpm: 8000                          # Groq free-tier TOKENS-per-minute budget; the token-aware throttle keeps estimated (prompt+max_new) tokens under this in any trailing 60s window so steady-state almost never 429s. Raise on a paid/dev tier.
   groq_max_retries: 8                     # 429-aware retries honouring the Retry-After header before raising (a per-MINUTE limit clears within ~60s)
+  cerebras_model: "llama-3.3-70b"        # Cerebras ListModels varies by account; common: llama-3.3-70b, llama3.1-8b, qwen-3-32b. If 404, check https://inference-docs.cerebras.ai models list and pick one.
+  cerebras_rpm: 5                         # Cerebras free trial is ~5 requests/min; the shared RPM throttle paces to this.
+  cerebras_tpm: 60000                     # per-MINUTE token budget for the rolling throttle; well under the ~1,000,000 tokens/DAY free-trial cap so steady-state almost never 429s. Raise on a paid tier.
+  cerebras_max_retries: 8                 # 429-aware retries honouring Retry-After (per-minute limits clear within ~60s)
   load_in_4bit: true               # requires CUDA + bitsandbytes; auto-falls back if unavailable
   dtype: "bfloat16"                # consulted ONLY on the CUDA path; CPU always uses float32 (NIT-2)
   device: "auto"                   # "auto" -> cuda if available else cpu
@@ -402,7 +406,7 @@ scales:
     llm:
       backend: "groq"                    # Groq hosted OpenAI-compatible API (no local GPU)
       groq_model: "openai/gpt-oss-20b"
-      max_new_tokens: 128                # override the base 768: the Reasoning+Score answer is ~1-2 sentences + a number, so 128 is plenty and roughly thirds the per-call token cost. Smaller calls fit more comfortably under Groq's 8000 TPM free-tier budget -> far fewer 429s.
+      max_new_tokens: 256                # was 128 -> truncated the score; 256 fits full Reasoning+Score without cutting off the number (the 128 cap caused ~45% fallback-3.0 junk).
       device: "cpu"
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
@@ -414,6 +418,91 @@ scales:
                                          # picks this up via the "*max_eval_users" suffix.
       groq_max_ablation_users: 20        # tighter cap for the ablations; can be raised likewise
     ablations:                           # SAME 3 uncertainty-critical ablations as gemini/kaggle_unc
+      - name: "no_uncertainty_term"
+        desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
+        override: { rerankers: { uc_asr: { gamma: 0.0 } } }
+      - name: "no_cluster_ratio_term"
+        desc: "UC-ASR beta=0 (drop beta*CR)"
+        override: { rerankers: { uc_asr: { beta: 0.0 } } }
+      - name: "gate_off_fixed_n3"
+        desc: "gate off -> fixed N=3 everywhere (UARO-like)"
+        override: {}
+
+  # --- CEREBRAS hosted-API profile: run the WHOLE pipeline on a CPU-only
+  #     laptop via Cerebras' OpenAI-compatible inference API. Free trial is
+  #     ~1,000,000 tokens/DAY (far more generous than Groq's effective cap) at
+  #     ~5 RPM with very fast inference, so a full ~3.45M-token 50-user run
+  #     finishes in ~3-4 short daily sessions (the SQLite cache resumes), or in
+  #     one sitting on the $5 signup credit. Modelling knobs mirror the other
+  #     API profiles. The API key is read ONLY from $CEREBRAS_API_KEY.
+  cerebras:
+    project:
+      seeds: [42]                        # single seed (the uncertainty mechanism is valid on one seed)
+    preprocessing:
+      n_users_subset: 10000
+      k_core: 5
+    retrievers:
+      top_k_candidates: 50
+      bpr_mf: { epochs: 50 }
+      lightgcn: { epochs: 50 }
+    uncertainty:
+      uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
+    llm:
+      backend: "cerebras"                # Cerebras hosted OpenAI-compatible API (no local GPU)
+      cerebras_model: "llama-3.3-70b"
+      max_new_tokens: 256                # full Reasoning+Score without truncation; keep >=256 for ATM trace clustering
+      device: "cpu"
+    rerankers:
+      uc_asr: { tune_on_val: false }     # skip val grid-search to save API calls
+    evaluation:
+      figure_dpi: 300
+      cerebras_max_eval_users: 50        # full eval set; the daily token budget comfortably covers this across a session or two. _resolve_cap picks this up via the "*max_eval_users" suffix.
+      cerebras_max_ablation_users: 20    # tighter cap for the ablations
+    ablations:                           # SAME 3 uncertainty-critical ablations as gemini/groq/local
+      - name: "no_uncertainty_term"
+        desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
+        override: { rerankers: { uc_asr: { gamma: 0.0 } } }
+      - name: "no_cluster_ratio_term"
+        desc: "UC-ASR beta=0 (drop beta*CR)"
+        override: { rerankers: { uc_asr: { beta: 0.0 } } }
+      - name: "gate_off_fixed_n3"
+        desc: "gate off -> fixed N=3 everywhere (UARO-like)"
+        override: {}
+
+  # --- LOCAL CPU-only profile: run the WHOLE pipeline with NO GPU, NO API, NO
+  #     quota. The LLM is a SMALL HuggingFace model on CPU (Qwen2.5-1.5B-Instruct),
+  #     which is weak-but-honest: the thesis contribution is the UC-ASR uncertainty
+  #     framework, and every method shares the SAME base LLM, so the comparison is
+  #     valid. Report the model honestly as a small CPU model. Designed to be left
+  #     running overnight; the SQLite cache resumes if interrupted. Modelling knobs
+  #     match the API profiles (K=50 candidates, N=3 stochastic passes @ T=0.7,
+  #     300-DPI figures) but the user cap is modest so a CPU run finishes overnight.
+  local:
+    project:
+      seeds: [42]                        # single seed (the uncertainty mechanism is valid on one seed)
+    preprocessing:
+      n_users_subset: 10000
+      k_core: 5
+    retrievers:
+      top_k_candidates: 50
+      bpr_mf: { epochs: 50 }
+      lightgcn: { epochs: 50 }
+    uncertainty:
+      uaro: { n_passes: 3 }              # REQUIRED: 3 stochastic passes @ T=0.7 (uncertainty core)
+    llm:
+      backend: "hf"                      # local HuggingFace transformers on CPU (no GPU, no API)
+      hf_model: "Qwen/Qwen2.5-1.5B-Instruct"  # small + CPU-viable; fallback Qwen2.5-0.5B-Instruct if RAM/time is tight
+      load_in_4bit: false                # no CUDA on this machine -> float32 CPU path (NIT-2)
+      dtype: "float32"
+      device: "cpu"
+      max_new_tokens: 256                # enough for Reasoning + Score without truncation; keep >=256 so ATM trace clustering has signal
+    rerankers:
+      uc_asr: { tune_on_val: false }     # skip val grid-search to save a full extra LLM pass
+    evaluation:
+      figure_dpi: 300
+      local_max_eval_users: 50           # full-ish eval set; CPU is slow but unlimited, so this runs overnight. _resolve_cap picks this up via the "*max_eval_users" suffix.
+      local_max_ablation_users: 20       # tighter cap for the ablations to keep the overnight run bounded
+    ablations:                           # SAME 3 uncertainty-critical ablations as gemini/groq/kaggle_unc
       - name: "no_uncertainty_term"
         desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
         override: { rerankers: { uc_asr: { gamma: 0.0 } } }
