@@ -325,8 +325,8 @@ scales:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save a full extra LLM pass
     evaluation:
       figure_dpi: 300                    # keep publication figures (fig3 = uncertainty/gate dist)
-      kaggle_unc_max_eval_users: 10      # SESSION-SIZED: ~230 unique LLM calls/user * 10 ~= 2,300 calls ~= 6-8h on a T4 (fits one 12h Kaggle session). Small sample -> accuracy metrics noisy, but the UC-ASR uncertainty mechanism (gate tiers, CR, call-savings, stability) is still meaningful. Report scale honestly. Cache resumes if the session times out; re-run to extend.
-      kaggle_unc_max_ablation_users: 6   # ablations on a tiny user set to keep the single-session fill bounded
+      kaggle_unc_max_eval_users: 5      # SESSION-SIZED: ~230 unique LLM calls/user * 10 ~= 2,300 calls ~= 6-8h on a T4 (fits one 12h Kaggle session). Small sample -> accuracy metrics noisy, but the UC-ASR uncertainty mechanism (gate tiers, CR, call-savings, stability) is still meaningful. Report scale honestly. Cache resumes if the session times out; re-run to extend.
+      kaggle_unc_max_ablation_users: 4   # ablations on a tiny user set to keep the single-session fill bounded
     ablations:                           # ONLY the 3 uncertainty-critical ablations (not all 10)
       - name: "no_uncertainty_term"
         desc: "UC-ASR gamma=0 (drop -gamma*U from FinalScore)"
