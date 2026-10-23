@@ -320,14 +320,12 @@ scales:
       load_in_4bit: true
       dtype: "bfloat16"
       device: "auto"
-      max_new_tokens: 256                # kept at 256 (NOT ~96): the ATM cluster
-                                         # ratio clusters the reasoning TRACES, so keep enough
-                                         # reasoning length for meaningful semantic clustering
+      max_new_tokens: 128                # cut from 256: the verdict-parser now reads a SHORT prose verdict, so the model no longer needs to ramble to 256 tokens (which was ~40s/call on the T4). 128 still leaves enough reasoning text for ATM trace clustering while roughly halving generation time.
     rerankers:
       uc_asr: { tune_on_val: false }     # skip val grid-search to save a full extra LLM pass
     evaluation:
       figure_dpi: 300                    # keep publication figures (fig3 = uncertainty/gate dist)
-      kaggle_unc_max_eval_users: 150     # 150 users: enough to populate the gate tiers + stable stats
+      kaggle_unc_max_eval_users: 100     # cut 150->100 to finish the fill in one session; still enough to populate the 3 gate tiers with stable stats
       kaggle_unc_max_ablation_users: 60  # ablations run on a smaller user set to save time
     ablations:                           # ONLY the 3 uncertainty-critical ablations (not all 10)
       - name: "no_uncertainty_term"
