@@ -200,6 +200,34 @@ _FRACTION_RE = re.compile(r"([-+]?\d*\.?\d+)\s*/\s*(\d+)")
 # "4 out of 5", "3 of 5".
 _OUT_OF_FIVE_RE = re.compile(r"([-+]?\d*\.?\d+)\s*(?:out of|of)\s*5\b", re.IGNORECASE)
 
+# Qualitative verdict fallback: weak instruct models (e.g. Qwen2.5-1.5B) often
+# write a clear prose verdict and OMIT the numeric Score entirely. Rather than
+# throw that away as a 3.0 default, map the strongest verdict phrase found to a
+# score. Ordered most-extreme first; the first pattern that matches wins. These
+# only fire AFTER every explicit-number branch has failed (so a real digit
+# always takes precedence).
+_VERDICT_PATTERNS = [
+    (1.0, re.compile(r"(no\s+relevan|not\s+relevant|zero\s+(?:relevan|correlation|connection|overlap)|absolutely\s+(?:no|zero)|\birrelevant|\bunrelated|no\s+(?:relation|connection|overlap|correlation)\b|does\s+not\s+align\s+at\s+all|does\s+not\s+(?:correspond|relate)|no\s+direct\s+(?:relevan|connection|correlation)|completely\s+(?:different|unrelated)|little\s+to\s+no|no\s+match\s+found|do(?:es)?\s+not\s+(?:share|form\s+part)|have\s+no\s+relation|nothing\s+in\s+common)", re.IGNORECASE)),
+    (5.0, re.compile(r"(perfect(?:ly)?\s+(?:match|align|fit|relevan)|aligns?\s+perfectly|highly\s+relevant|very\s+relevant|closely\s+match|matches?\s+(?:perfectly|very\s+well|well\b|most\s+closely|closely)|match\s+perfectly|strong(?:ly)?\s+relevan|seamlessly|fits?\s+(?:perfectly|seamlessly)|caters?\s+directly|complements?\b)", re.IGNORECASE)),
+    (2.0, re.compile(r"(little\s+(?:overlap|relevan|connection)|lacks?\s+relevan|lacks?\s+(?:direct\s+)?(?:connection|relevan)|low\s+relevan|loosely\s+relat|only\s+slightly|only\s+loosely|weakly\s+relat|not\s+closely|falls?\s+(?:outside|far\s+outside)|diverges?|differs?\s+(?:from|significantly)|only\s+somewhat|less\s+likely|minimal\s+(?:overlap|connection))", re.IGNORECASE)),
+    (4.0, re.compile(r"(fairly\s+relevant|mostly\s+relevant|good\s+(?:match|fit)|aligns?\s+well|fits?\s+well|reasonably\s+relevant|quite\s+relevant|aligns?\s+best|matches?\s+into|fits?\s+into\s+(?:multiple|both)|\brelated\b|could\s+(?:be|complement))", re.IGNORECASE)),
+    (3.0, re.compile(r"(some(?:what)?\s+(?:relevan|overlap|related|similar)|share\s+some|overlap\s+slightly|slight(?:ly)?\s+(?:overlap|similar)|moderate(?:ly)?\s+(?:relevan|fit)|partial(?:ly)?\s+(?:relevan|match|align)|medium\s+(?:relevan|roast|fit)|some\s+similarity|but\s+still|middle\s+ground)", re.IGNORECASE)),
+]
+
+
+def _verdict_score(text):
+    """Map a qualitative prose verdict to a score when no number was emitted.
+
+    Returns a float in the configured range, or ``None`` if no verdict phrase
+    matched. Checks most-extreme phrasings first so 'no relevance' beats a
+    stray 'related'. This is a LAST resort used only after all numeric branches.
+    """
+    for score, pat in _VERDICT_PATTERNS:
+        if pat.search(text):
+            return score
+    return None
+
+
 
 def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
     """Tolerant parse of a reason-first / score-last LLM response.
@@ -263,6 +291,16 @@ def parse_response(text: str, rmin: float, rmax: float) -> Dict[str, Any]:
     anyvalid = [float(x) for x in _REL_RE.findall(text) if rmin <= float(x) <= rmax]
     if anyvalid:
         return {"reasoning": reasoning, "relevance": float(anyvalid[-1]), "parsed_ok": True}
+
+    # 4.5 Qualitative verdict fallback: the model wrote a clear prose verdict
+    #     ("no relevance", "aligns perfectly", ...) but emitted NO number. Map
+    #     the strongest matching phrase to a score so a weak instruct model's
+    #     real judgement is not discarded as a 3.0 default. parsed_ok=True since
+    #     this is a genuine (if coarse) model judgement, not a blind midpoint.
+    verdict = _verdict_score(text)
+    if verdict is not None:
+        num = max(rmin, min(rmax, float(verdict)))
+        return {"reasoning": reasoning, "relevance": float(num), "parsed_ok": True}
 
     # 5. True midpoint default (the only parsed_ok=False path).
     mid = (rmin + rmax) / 2.0
